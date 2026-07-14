@@ -15,8 +15,131 @@ return args.FirstOrDefault() switch
     "find" => Find(args[1..]),
     "stats" => Stats(args[1..]),
     "probe" => Probe(args[1..]),
+    "export" => Export(args[1..]),
     _ => Usage(),
 };
+
+static int Export(string[] args)
+{
+    if (args.Length == 0)
+    {
+        Console.WriteLine("usage: pre export <query> [--out <dir>]");
+        return 1;
+    }
+
+    var queryParts = new List<string>();
+    var outDir = "export";
+    var extraBundles = new List<string>();
+    for (var i = 0; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--out": outDir = args[++i]; break;
+            case "--bundles": extraBundles.Add(args[++i]); break;
+            default: queryParts.Add(args[i]); break;
+        }
+    }
+    var query = string.Join(' ', queryParts);
+
+    var catalog = RustCatalog.LoadNewest();
+    if (catalog == null)
+    {
+        Console.WriteLine("no catalog found - run: pre catalog");
+        return 1;
+    }
+
+    // Resolve the query to a prefab path, preferring exact shortname/name hits.
+    var matches = catalog.Find(query).Where(e => e.PrefabPath.Length > 0).ToList();
+    var entry = matches.FirstOrDefault(e => e.ShortName.Equals(query, StringComparison.OrdinalIgnoreCase))
+        ?? matches.FirstOrDefault(e => e.Name.Equals(query, StringComparison.OrdinalIgnoreCase))
+        ?? matches.FirstOrDefault();
+    if (entry == null)
+    {
+        Console.WriteLine($"nothing in the catalog matches '{query}' with a prefab path");
+        return 1;
+    }
+    var targetName = Path.GetFileNameWithoutExtension(entry.PrefabPath);
+    Console.WriteLine($"target: {entry.Name} -> {entry.PrefabPath}");
+
+    var install = RustLocator.GetInstalls().FirstOrDefault();
+    if (install == null)
+    {
+        Console.WriteLine("no Rust install detected");
+        return 1;
+    }
+
+    Logger.Add(new ConsoleLogger(false));
+    var handler = new ExportHandler(new FullConfiguration());
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    List<string> loadPaths =
+    [
+        Path.Combine(install.BundlesPath, "shared", "assetscenes.bundle"),
+        Path.Combine(install.BundlesPath, "shared", "content.bundle"),
+        .. extraBundles,
+    ];
+    GameData gameData = handler.LoadAndProcess(loadPaths, LocalFileSystem.Instance);
+    Console.WriteLine($"loaded in {sw.Elapsed.TotalSeconds:F1}s");
+
+    // Prefer a processed prefab hierarchy; fall back to a GameObject subtree
+    // (Rust ships most prefab content inside AssetScene-* scene files).
+    IEnumerable<AssetRipper.Assets.IUnityObjectBase>? exportSet = null;
+    var hierarchy = gameData.GameBundle.FetchAssets()
+        .OfType<AssetRipper.Processing.Prefabs.PrefabHierarchyObject>()
+        .FirstOrDefault(h => h.Name.String.Equals(targetName, StringComparison.OrdinalIgnoreCase));
+    if (hierarchy != null)
+    {
+        Console.WriteLine("matched a prefab hierarchy");
+        exportSet = hierarchy.Assets;
+    }
+    else
+    {
+        var gameObjects = gameData.GameBundle.FetchAssets()
+            .OfType<AssetRipper.SourceGenerated.Classes.ClassID_1.IGameObject>()
+            .ToList();
+        // Roots in the AssetScene-prefabs scene are named by their full prefab path.
+        var root = gameObjects.FirstOrDefault(go => (go.Name.String ?? "").Equals(entry.PrefabPath, StringComparison.OrdinalIgnoreCase))
+            ?? gameObjects.FirstOrDefault(go => (go.Name.String ?? "").Equals(targetName, StringComparison.OrdinalIgnoreCase))
+            ?? gameObjects.FirstOrDefault(go => (go.Name.String ?? "").Contains(targetName, StringComparison.OrdinalIgnoreCase));
+        if (root != null)
+        {
+            Console.WriteLine($"matched GameObject '{root.Name.String}' in collection '{root.Collection.Name}'");
+            exportSet = AssetRipper.SourceGenerated.Extensions.GameObjectExtensions.FetchHierarchy(root)
+                .Cast<AssetRipper.Assets.IUnityObjectBase>();
+        }
+        else
+        {
+            var probe = targetName.Length >= 6 ? targetName[..6] : targetName;
+            var near = gameObjects
+                .Select(go => go.Name.String ?? "")
+                .Where(n => n.Contains(probe, StringComparison.OrdinalIgnoreCase))
+                .Distinct()
+                .Take(20)
+                .ToList();
+            Console.WriteLine($"near-miss GameObject names containing '{probe}': {(near.Count > 0 ? string.Join(", ", near) : "(none)")}");
+            Console.WriteLine($"total GameObjects loaded: {gameObjects.Count}");
+        }
+    }
+    if (exportSet == null)
+    {
+        Console.WriteLine($"nothing named '{targetName}' found in loaded bundles");
+        return 1;
+    }
+
+    Directory.CreateDirectory(outDir);
+    var outPath = Path.GetFullPath(Path.Combine(outDir, $"{targetName}.glb"));
+    sw.Restart();
+    var ok = AssetRipper.Export.PrimaryContent.Models.GlbModelExporter.ExportModel(
+        exportSet, outPath, false, LocalFileSystem.Instance);
+    sw.Stop();
+
+    if (!ok || !File.Exists(outPath))
+    {
+        Console.WriteLine("export FAILED");
+        return 1;
+    }
+    Console.WriteLine($"exported in {sw.Elapsed.TotalSeconds:F1}s: {outPath} ({new FileInfo(outPath).Length / 1024} KB)");
+    return 0;
+}
 
 static int Probe(string[] paths)
 {
