@@ -79,7 +79,7 @@ internal static class Cli
         }
 
         Logger.Add(new ConsoleLogger(false));
-        var handler = new ExportHandler(new FullConfiguration());
+        var handler = new PrimeExportHandler(new FullConfiguration());
         var sw = System.Diagnostics.Stopwatch.StartNew();
         GameData gameData = handler.LoadAndProcess(paths, LocalFileSystem.Instance);
         Console.WriteLine($"loaded in {sw.Elapsed.TotalSeconds:F1}s");
@@ -166,9 +166,31 @@ internal static class Cli
         {
             return 1;
         }
+        session = EnsureTextures(session, string.Join(' ', queryParts), extraBundles);
         var result = session.ExportGlb(string.Join(' ', queryParts), outDir);
         Console.WriteLine(result.Message);
         return result.Success ? 0 : 1;
+    }
+
+    /// <summary>
+    /// If the target's materials reference textures in unloaded bundles, restart
+    /// the session with exactly those bundles added (automatic dependency closure).
+    /// </summary>
+    internal static Session EnsureTextures(Session session, string query, List<string> extraBundles)
+    {
+        var resolved = session.ResolveExportSet(query);
+        if (resolved == null)
+        {
+            return session;
+        }
+        var missing = session.FindMissingTextureBundles(resolved.Value.Assets);
+        if (missing.Count == 0)
+        {
+            return session;
+        }
+        Console.WriteLine($"texture closure: loading {missing.Count} additional bundle(s): {string.Join(", ", missing.Select(Path.GetFileName))}");
+        var expanded = extraBundles.Concat(missing).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        return Session.Start(expanded) ?? session;
     }
 
     public static int Mat(string[] args)
@@ -231,41 +253,41 @@ internal static class Cli
             var context = listener.GetContext();
             try
             {
-                HandleRequest(session, context);
+                var request = context.Request;
+                var q = request.QueryString["q"] ?? "";
+                switch (request.Url?.AbsolutePath)
+                {
+                    case "/status":
+                        WriteJson(context, 200, new { build = session.Catalog.BuildId, entries = session.Catalog.Entries.Count, loadedBundles = session.LoadedBundles.Select(Path.GetFileName), uptimeSeconds = (int)session.Uptime.TotalSeconds });
+                        break;
+                    case "/find":
+                        var limit = int.TryParse(request.QueryString["limit"], out var l) ? l : 25;
+                        var results = session.Catalog.Find(q, request.QueryString["kind"], request.QueryString["category"], request.QueryString["path"]).Take(limit).ToList();
+                        WriteJson(context, 200, results);
+                        break;
+                    case "/export":
+                        var outDir = request.QueryString["out"] ?? "export";
+                        if (request.QueryString["notex"] == null)
+                        {
+                            // automatic texture closure may replace the session with a bigger one
+                            session = Cli.EnsureTextures(session, q, extraBundles);
+                        }
+                        var result = session.ExportGlb(q, outDir);
+                        WriteJson(context, result.Success ? 200 : 404, new { success = result.Success, message = result.Message, path = result.Path, seconds = result.Seconds });
+                        break;
+                    case "/mat":
+                        var report = session.MaterialReport(q);
+                        WriteJson(context, report != null ? 200 : 404, new { report });
+                        break;
+                    default:
+                        WriteJson(context, 404, new { error = "unknown endpoint" });
+                        break;
+                }
             }
             catch (Exception ex)
             {
-                WriteJson(context, 500, new { error = ex.Message });
+                try { WriteJson(context, 500, new { error = ex.Message }); } catch { }
             }
-        }
-    }
-
-    private static void HandleRequest(Session session, HttpListenerContext context)
-    {
-        var request = context.Request;
-        var q = request.QueryString["q"] ?? "";
-        switch (request.Url?.AbsolutePath)
-        {
-            case "/status":
-                WriteJson(context, 200, new { build = session.Catalog.BuildId, entries = session.Catalog.Entries.Count, uptimeSeconds = (int)session.Uptime.TotalSeconds });
-                break;
-            case "/find":
-                var limit = int.TryParse(request.QueryString["limit"], out var l) ? l : 25;
-                var results = session.Catalog.Find(q, request.QueryString["kind"], request.QueryString["category"], request.QueryString["path"]).Take(limit).ToList();
-                WriteJson(context, 200, results);
-                break;
-            case "/export":
-                var outDir = request.QueryString["out"] ?? "export";
-                var result = session.ExportGlb(q, outDir);
-                WriteJson(context, result.Success ? 200 : 404, new { success = result.Success, message = result.Message, path = result.Path, seconds = result.Seconds });
-                break;
-            case "/mat":
-                var report = session.MaterialReport(q);
-                WriteJson(context, report != null ? 200 : 404, new { report });
-                break;
-            default:
-                WriteJson(context, 404, new { error = "unknown endpoint" });
-                break;
         }
     }
 
@@ -286,7 +308,7 @@ internal static class Cli
             return Usage();
         }
         Logger.Add(new ConsoleLogger(false));
-        var handler = new ExportHandler(new FullConfiguration());
+        var handler = new PrimeExportHandler(new FullConfiguration());
         var sw = System.Diagnostics.Stopwatch.StartNew();
         GameData gameData = handler.LoadAndProcess(paths, LocalFileSystem.Instance);
         sw.Stop();
@@ -309,6 +331,23 @@ internal static class Cli
 }
 
 /// <summary>
+/// ExportHandler with only the processors GLB hierarchy export needs.
+/// Skips assembly/sprite/audio/lighting processing - faster, and avoids a
+/// SpriteProcessor assertion crash when texture bundles are co-loaded.
+/// </summary>
+internal sealed class PrimeExportHandler : ExportHandler
+{
+    public PrimeExportHandler(FullConfiguration settings) : base(settings) { }
+
+    protected override IEnumerable<AssetRipper.Processing.IAssetProcessor> GetProcessors()
+    {
+        yield return new AssetRipper.Processing.Scenes.SceneDefinitionProcessor();
+        yield return new AssetRipper.Processing.MainAssetProcessor();
+        yield return new AssetRipper.Processing.Prefabs.PrefabProcessor();
+    }
+}
+
+/// <summary>
 /// A loaded game session: bundles parsed once, then queried/exported repeatedly.
 /// This is the heart of daemon mode and the future UI backend.
 /// </summary>
@@ -316,8 +355,11 @@ internal sealed class Session
 {
     public required GameData GameData { get; init; }
     public required RustCatalog Catalog { get; init; }
+    public required BundleIndex Index { get; init; }
+    public required List<string> LoadedBundles { get; init; }
     private readonly System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
     public TimeSpan Uptime => clock.Elapsed;
+    private static bool loggerInitialized;
 
     public static Session? Start(List<string> extraBundles)
     {
@@ -334,8 +376,13 @@ internal sealed class Session
             return null;
         }
 
-        Logger.Add(new ConsoleLogger(false));
-        var handler = new ExportHandler(new FullConfiguration());
+        if (!loggerInitialized)
+        {
+            Logger.Add(new ConsoleLogger(false));
+            loggerInitialized = true;
+        }
+        var index = BundleIndex.LoadOrBuild(install.BundlesPath, install.BuildId ?? "unknown");
+        var handler = new PrimeExportHandler(new FullConfiguration());
         var sw = System.Diagnostics.Stopwatch.StartNew();
         List<string> loadPaths =
         [
@@ -343,9 +390,48 @@ internal sealed class Session
             Path.Combine(install.BundlesPath, "shared", "content.bundle"),
             .. extraBundles,
         ];
+        loadPaths = loadPaths.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         GameData gameData = handler.LoadAndProcess(loadPaths, LocalFileSystem.Instance);
         Console.WriteLine($"session loaded in {sw.Elapsed.TotalSeconds:F1}s ({loadPaths.Count} bundles)");
-        return new Session { GameData = gameData, Catalog = catalog };
+        return new Session { GameData = gameData, Catalog = catalog, Index = index, LoadedBundles = loadPaths };
+    }
+
+    /// <summary>
+    /// Bundles (not yet loaded) that hold the textures referenced by the export set's materials.
+    /// FileID N in a PPtr indexes the owning collection's dependency table at N-1.
+    /// </summary>
+    public List<string> FindMissingTextureBundles(IEnumerable<IUnityObjectBase> exportSet)
+    {
+        var needed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var renderer in exportSet.OfType<IRenderer>())
+        {
+            foreach (var materialPtr in renderer.Materials_C25)
+            {
+                if (!materialPtr.TryGetAsset(renderer.Collection, out IMaterial? material))
+                {
+                    continue;
+                }
+                string[]? deps = null;
+                foreach (var (_, texEnv) in material.GetTextureProperties())
+                {
+                    var pptr = texEnv.Texture;
+                    if (pptr.IsNull() || pptr.FileID <= 0 || pptr.TryGetAsset(material.Collection, out _))
+                    {
+                        continue;
+                    }
+                    deps ??= Index.GetDependencies(material.Collection.Name);
+                    if (pptr.FileID - 1 < deps.Length)
+                    {
+                        var cab = deps[pptr.FileID - 1];
+                        if (Index.CabToBundle.TryGetValue(cab, out var bundle))
+                        {
+                            needed.Add(bundle);
+                        }
+                    }
+                }
+            }
+        }
+        return needed.Where(b => !LoadedBundles.Contains(b, StringComparer.OrdinalIgnoreCase)).ToList();
     }
 
     public CatalogEntry? Resolve(string query)
@@ -354,6 +440,43 @@ internal sealed class Session
         return matches.FirstOrDefault(e => e.ShortName.Equals(query, StringComparison.OrdinalIgnoreCase))
             ?? matches.FirstOrDefault(e => e.Name.Equals(query, StringComparison.OrdinalIgnoreCase))
             ?? matches.FirstOrDefault();
+    }
+
+    /// <summary>
+    /// Drop GameObjects whose subtree contains no renderer (colliders, sockets,
+    /// logic nodes...) so the export doesn't import as a forest of empties.
+    /// Ancestor chains of mesh carriers are kept so transforms stay intact.
+    /// </summary>
+    public static IEnumerable<IUnityObjectBase> PruneToMeshCarriers(IEnumerable<IUnityObjectBase> assets)
+    {
+        var list = assets.ToList();
+        var keep = new HashSet<IGameObject>();
+        foreach (var gameObject in list.OfType<IGameObject>())
+        {
+            if (gameObject.FetchHierarchy().OfType<IRenderer>().Any())
+            {
+                keep.Add(gameObject);
+            }
+        }
+        foreach (var asset in list)
+        {
+            switch (asset)
+            {
+                case IGameObject go when keep.Contains(go):
+                    yield return go;
+                    break;
+                case AssetRipper.SourceGenerated.Classes.ClassID_2.IComponent component
+                    when component.GameObject_C2P is IGameObject owner && keep.Contains(owner):
+                    yield return component;
+                    break;
+                case IGameObject:
+                case AssetRipper.SourceGenerated.Classes.ClassID_2.IComponent:
+                    break;
+                default:
+                    yield return asset;
+                    break;
+            }
+        }
     }
 
     public (IEnumerable<IUnityObjectBase> Assets, string Name)? ResolveExportSet(string query)
@@ -384,7 +507,7 @@ internal sealed class Session
         return null;
     }
 
-    public (bool Success, string Message, string? Path, double Seconds) ExportGlb(string query, string outDir)
+    public (bool Success, string Message, string? Path, double Seconds) ExportGlb(string query, string outDir, bool prune = true)
     {
         var resolved = ResolveExportSet(query);
         if (resolved == null)
@@ -393,9 +516,10 @@ internal sealed class Session
         }
         Directory.CreateDirectory(outDir);
         var outPath = System.IO.Path.GetFullPath(System.IO.Path.Combine(outDir, $"{resolved.Value.Name}.glb"));
+        var exportAssets = prune ? PruneToMeshCarriers(resolved.Value.Assets) : resolved.Value.Assets;
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var ok = AssetRipper.Export.PrimaryContent.Models.GlbModelExporter.ExportModel(
-            resolved.Value.Assets, outPath, false, LocalFileSystem.Instance);
+            exportAssets, outPath, false, LocalFileSystem.Instance);
         sw.Stop();
         return ok && File.Exists(outPath)
             ? (true, $"exported in {sw.Elapsed.TotalSeconds:F1}s: {outPath} ({new FileInfo(outPath).Length / 1024} KB)", outPath, sw.Elapsed.TotalSeconds)
