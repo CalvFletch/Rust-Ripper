@@ -170,6 +170,7 @@ internal static class Cli
                 case "--shadows": options = options with { IncludeShadowProxies = true }; break;
                 case "--no-prune": options = options with { PruneEmpties = false }; break;
                 case "--vertex-colors": options = options with { IncludeVertexColors = true }; break;
+                case "--paint-nodes": options = options with { PaintNodes = true }; break;
                 default: queryParts.Add(args[i]); break;
             }
         }
@@ -337,6 +338,7 @@ internal static class Cli
                             IncludeShadowProxies = request.QueryString["shadows"] != null,
                             PruneEmpties = request.QueryString["no-prune"] == null,
                             IncludeVertexColors = request.QueryString["vertex-colors"] != null,
+                            PaintNodes = request.QueryString["paint-nodes"] != null,
                         };
                         var result = session.ExportGlb(q, outDir, options);
                         WriteJson(context, result.Success ? 200 : 404, new { success = result.Success, message = result.Message, path = result.Path, seconds = result.Seconds });
@@ -601,7 +603,7 @@ internal sealed class Session
         Directory.CreateDirectory(outDir);
         var outPath = System.IO.Path.GetFullPath(System.IO.Path.Combine(outDir, $"{resolved.Value.Name}.glb"));
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var sceneBuilder = RipperGlbBuilder.Build(resolved.Value.Root, options, out var tintMaterials, out var detailPaint);
+        var sceneBuilder = RipperGlbBuilder.Build(resolved.Value.Root, options, out var builder);
         bool ok;
         using (var fileStream = File.Create(outPath))
         {
@@ -610,9 +612,9 @@ internal sealed class Session
                 var model = sceneBuilder.ToGltf2();
                 if (!options.IncludeVertexColors)
                 {
-                    RipperGlbBuilder.DemoteMaskVertexColors(model, tintMaterials);
+                    RipperGlbBuilder.DemoteMaskVertexColors(model, builder.VertexColorTintMaterials);
                 }
-                RipperGlbBuilder.AddPaintAttributes(model, detailPaint);
+                RipperGlbBuilder.AddPaintAttributes(model, builder.DetailPaint);
                 model.WriteGLB(fileStream);
                 ok = true;
             }
@@ -620,6 +622,19 @@ internal sealed class Session
             {
                 Logger.Error($"GLB write failed: {ex.Message}");
                 ok = false;
+            }
+        }
+        // paint-node sidecars: the detail masks as PNGs next to the GLB
+        if (ok && options.PaintNodes)
+        {
+            foreach (var (_, (materialName, mask)) in builder.DetailMasks)
+            {
+                if (RipperMaterialFactory.TryDecodePng(mask, out var png))
+                {
+                    var maskPath = System.IO.Path.Combine(outDir, $"{resolved.Value.Name}.paintmask.{materialName}.png");
+                    File.WriteAllBytes(maskPath, png);
+                    Console.WriteLine($"paint mask: {maskPath}");
+                }
             }
         }
         sw.Stop();

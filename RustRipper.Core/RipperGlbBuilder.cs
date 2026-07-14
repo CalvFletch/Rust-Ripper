@@ -38,6 +38,11 @@ public record RipperGlbOptions
     /// Rust otherwise uses them for shader masks (wind weights, AO), and glTF
     /// viewers multiplying COLOR_0 into base color would blacken meshes.</summary>
     public bool IncludeVertexColors { get; init; } = false;
+
+    /// <summary>Leave detail paint UNBAKED for node-graph workflows: albedo stays
+    /// raw, the _DetailMask textures are written as PNGs next to the GLB, and
+    /// _RUST_PAINT carries the colour — the addon builds mask-driven Mix nodes.</summary>
+    public bool PaintNodes { get; init; } = false;
 }
 
 /// <summary>
@@ -52,7 +57,7 @@ public class RipperGlbBuilder
     private static readonly string[] FacepunchLodClasses = ["RendererLOD", "MeshLOD", "SkinnedMeshLOD"];
 
     private readonly RipperGlbOptions options;
-    private readonly RipperMaterialFactory materials = new();
+    private readonly RipperMaterialFactory materials;
     private readonly Dictionary<IMesh, MeshData> meshCache = new();
     private readonly Dictionary<IRenderer, (int Level, bool ShadowOnly)> lodMembership = new();
     private readonly HashSet<IGameObject> keep = new();
@@ -61,22 +66,23 @@ public class RipperGlbBuilder
     private RipperGlbBuilder(RipperGlbOptions options)
     {
         this.options = options;
+        materials = new RipperMaterialFactory(options.PaintNodes);
     }
 
-    public static SceneBuilder Build(IGameObject root, RipperGlbOptions options)
-        => Build(root, options, out _, out _);
+    public IReadOnlySet<long> VertexColorTintMaterials => vertexColorTintMaterials;
+    public IReadOnlyDictionary<long, System.Numerics.Vector4> DetailPaint => materials.DetailPaint;
+    public IReadOnlyDictionary<long, (string MaterialName, AssetRipper.SourceGenerated.Classes.ClassID_28.ITexture2D Mask)> DetailMasks => materials.DetailMasks;
 
-    public static SceneBuilder Build(IGameObject root, RipperGlbOptions options,
-        out IReadOnlySet<long> vertexColorTintMaterials,
-        out IReadOnlyDictionary<long, System.Numerics.Vector4> detailPaint)
+    public static SceneBuilder Build(IGameObject root, RipperGlbOptions options)
+        => Build(root, options, out _);
+
+    public static SceneBuilder Build(IGameObject root, RipperGlbOptions options, out RipperGlbBuilder builder)
     {
-        var builder = new RipperGlbBuilder(options);
+        builder = new RipperGlbBuilder(options);
         builder.BuildLodMembership(root);
         builder.BuildKeepSet(root);
         var sceneBuilder = new SceneBuilder();
         builder.AddGameObject(sceneBuilder, null, root.GetTransform());
-        vertexColorTintMaterials = builder.vertexColorTintMaterials;
-        detailPaint = builder.materials.DetailPaint;
         return sceneBuilder;
     }
 
@@ -106,8 +112,11 @@ public class RipperGlbBuilder
                 {
                     continue;
                 }
+                // Blender color attributes are linear; _DetailColor is authored sRGB
+                var linear = new System.Numerics.Vector4(
+                    MathF.Pow(paint.X, 2.2f), MathF.Pow(paint.Y, 2.2f), MathF.Pow(paint.Z, 2.2f), paint.W);
                 var flat = new System.Numerics.Vector4[vertexCount];
-                Array.Fill(flat, paint);
+                Array.Fill(flat, linear);
                 primitive.WithVertexAccessor("_RUST_PAINT", flat);
             }
         }

@@ -26,6 +26,16 @@ public class RipperMaterialFactory
     /// <summary>Materials whose detail-layer paint was baked: PathID -> _DetailColor (as authored, sRGB).</summary>
     public Dictionary<long, System.Numerics.Vector4> DetailPaint { get; } = new();
 
+    /// <summary>Paint-node mode: mask textures per painted material, for sidecar export.</summary>
+    public Dictionary<long, (string MaterialName, ITexture2D Mask)> DetailMasks { get; } = new();
+
+    private readonly bool paintNodes;
+
+    public RipperMaterialFactory(bool paintNodes = false)
+    {
+        this.paintNodes = paintNodes;
+    }
+
     public MaterialBuilder GetOrMake(IMaterial? material)
     {
         if (material is null)
@@ -129,18 +139,28 @@ public class RipperMaterialFactory
         if (!baseColorSet && detailTintActive && diffuseTexture is not null)
         {
             colors.TryGetValue("_DetailColor", out var dc);
-            var key = (diffuseTexture, $"detailtint:{detailMask!.PathID}:{dc.X:F3}:{dc.Y:F3}:{dc.Z:F3}");
-            if (!imageCache.TryGetValue(key, out var tintedImage))
+            if (paintNodes)
             {
-                tintedImage = DecodeDetailTint(diffuseTexture, detailMask, dc);
-                imageCache.Add(key, tintedImage);
-            }
-            if (tintedImage is not null)
-            {
-                builder.WithBaseColor(tintedImage.Value, baseColor);
-                NameChannelImage(builder, KnownChannel.BaseColor, diffuseTexture.Name.String);
+                // leave the albedo raw; the mask ships as a sidecar and the
+                // colour rides in _RUST_PAINT for a mask-driven Mix node setup
                 DetailPaint[material.PathID] = dc;
-                baseColorSet = true;
+                DetailMasks[material.PathID] = (material.Name.String, detailMask!);
+            }
+            else
+            {
+                var key = (diffuseTexture, $"detailtint:{detailMask!.PathID}:{dc.X:F3}:{dc.Y:F3}:{dc.Z:F3}");
+                if (!imageCache.TryGetValue(key, out var tintedImage))
+                {
+                    tintedImage = DecodeDetailTint(diffuseTexture, detailMask, dc);
+                    imageCache.Add(key, tintedImage);
+                }
+                if (tintedImage is not null)
+                {
+                    builder.WithBaseColor(tintedImage.Value, baseColor);
+                    NameChannelImage(builder, KnownChannel.BaseColor, diffuseTexture.Name.String);
+                    DetailPaint[material.PathID] = dc;
+                    baseColorSet = true;
+                }
             }
         }
         if (!baseColorSet && diffuseTexture is not null && ColorizeEnabled(floats)
@@ -207,9 +227,15 @@ public class RipperMaterialFactory
         }
         else if (TryGetImage(material, $"specgloss:{glossMapScale:F3}", out var sgImage, out var sgName, "_SpecGlossMap", "_SpecularMap", "_Specular"))
         {
-            // approximation: gloss alpha becomes roughness, non-metal
+            // gloss alpha becomes roughness (non-metal), and the spec map's RGB
+            // is the dielectric F0 exactly - KHR_materials_specular carries it
+            // (Blender wires specularColorTexture into Specular Tint)
             builder.WithMetallicRoughness(sgImage.Value, 0f, 1f);
             NameChannelImage(builder, KnownChannel.MetallicRoughness, sgName);
+            if (TryGetImage(material, "raw", out var sgRaw, out var sgRawName, "_SpecGlossMap", "_SpecularMap", "_Specular"))
+            {
+                builder.WithSpecularColor(ImageBuilder.From(sgRaw.Value, sgRawName ?? "specular"), null);
+            }
         }
         else if (smoothnessFromAlbedo && diffuseTexture is not null
             && TryGetImage(material, $"albedogloss:{glossMapScale:F3}", out var agImage, out var agName, "_MainTex", "_BaseColorMap", "_AlbedoMap", "_Diffuse"))
@@ -328,6 +354,20 @@ public class RipperMaterialFactory
             }
         }
         return false;
+    }
+
+    /// <summary>Decode any texture straight to PNG bytes (sidecar export).</summary>
+    public static bool TryDecodePng(ITexture2D texture, [NotNullWhen(true)] out byte[]? png)
+    {
+        png = null;
+        if (!TextureConverter.TryConvertToBitmap(texture, out DirectBitmap bitmap))
+        {
+            return false;
+        }
+        using var stream = new MemoryStream();
+        bitmap.SaveAsPng(stream);
+        png = stream.ToArray();
+        return true;
     }
 
     private static ITexture2D? GetTexture(IMaterial material, params string[] slotNames)
