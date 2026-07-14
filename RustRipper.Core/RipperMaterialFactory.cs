@@ -143,6 +143,26 @@ public class RipperMaterialFactory
                 baseColorSet = true;
             }
         }
+        if (!baseColorSet && diffuseTexture is not null && ColorizeEnabled(floats)
+            && GetTexture(material, "_ColorizeMask") is { } colorizeMask)
+        {
+            var cR = colors.TryGetValue("_ColorizeColorR", out var vr) ? vr : new System.Numerics.Vector4(1, 1, 1, 0);
+            var cG = colors.TryGetValue("_ColorizeColorG", out var vg) ? vg : new System.Numerics.Vector4(1, 1, 1, 0);
+            var cB = colors.TryGetValue("_ColorizeColorB", out var vb) ? vb : new System.Numerics.Vector4(1, 1, 1, 0);
+            var cA = colors.TryGetValue("_ColorizeColorA", out var va) ? va : new System.Numerics.Vector4(1, 1, 1, 0);
+            var key = (diffuseTexture, $"colorize:{colorizeMask.PathID}:{cR}:{cG}:{cB}:{cA}");
+            if (!imageCache.TryGetValue(key, out var colorizedImage))
+            {
+                colorizedImage = DecodeColorize(diffuseTexture, colorizeMask, cR, cG, cB, cA);
+                imageCache.Add(key, colorizedImage);
+            }
+            if (colorizedImage is not null)
+            {
+                builder.WithBaseColor(colorizedImage.Value, baseColor);
+                NameChannelImage(builder, KnownChannel.BaseColor, diffuseTexture.Name.String);
+                baseColorSet = true;
+            }
+        }
         if (!baseColorSet && TryGetImage(material, "raw", out var mainImage, out var mainName, "_MainTex", "_BaseColorMap", "_AlbedoMap", "_Diffuse"))
         {
             builder.WithBaseColor(mainImage.Value, baseColor);
@@ -321,6 +341,95 @@ public class RipperMaterialFactory
             }
         }
         return null;
+    }
+
+    /// <summary>
+    /// Colorize is authored on many materials but only active when an enable
+    /// flag says so (stock clothing has _ColorizeLayer=1 with Enabled=0 - the
+    /// layer exists for runtime skin tinting). When no enable flag is present
+    /// at all, _ColorizeLayer alone decides.
+    /// </summary>
+    public static bool ColorizeEnabled(Dictionary<string, float> floats)
+    {
+        if (!floats.TryGetValue("_ColorizeLayer", out var layer) || layer == 0f)
+        {
+            return false;
+        }
+        var hasFlag = floats.ContainsKey("_ColorizeLayerEnabled") || floats.ContainsKey("colorizeLayerEnabled");
+        if (!hasFlag)
+        {
+            return true;
+        }
+        return (floats.TryGetValue("_ColorizeLayerEnabled", out var e1) && e1 != 0f)
+            || (floats.TryGetValue("colorizeLayerEnabled", out var e2) && e2 != 0f);
+    }
+
+    /// <summary>
+    /// Bake the colorize layer: the _ColorizeMask's R/G/B/A channels select
+    /// where _ColorizeColorR/G/B/A multiply into the albedo (linear space);
+    /// each colour's own alpha scales its strength.
+    /// </summary>
+    private static MemoryImage? DecodeColorize(ITexture2D diffuseTexture, ITexture2D maskTexture,
+        System.Numerics.Vector4 cR, System.Numerics.Vector4 cG, System.Numerics.Vector4 cB, System.Numerics.Vector4 cA)
+    {
+        if (!TextureConverter.TryConvertToBitmap(diffuseTexture, out DirectBitmap diffuseBitmap)
+            || !TextureConverter.TryConvertToBitmap(maskTexture, out DirectBitmap maskBitmap))
+        {
+            return null;
+        }
+        using var diffuseStream = new MemoryStream();
+        diffuseBitmap.SaveAsPng(diffuseStream);
+        diffuseStream.Position = 0;
+        using var maskStream = new MemoryStream();
+        maskBitmap.SaveAsPng(maskStream);
+        maskStream.Position = 0;
+
+        using var diffuse = Image.Load<Rgba32>(diffuseStream);
+        using var mask = Image.Load<Rgba32>(maskStream);
+        if (mask.Width != diffuse.Width || mask.Height != diffuse.Height)
+        {
+            mask.Mutate(x => x.Resize(diffuse.Width, diffuse.Height));
+        }
+
+        Span<System.Numerics.Vector3> tints =
+        [
+            new(MathF.Pow(cR.X, 2.2f), MathF.Pow(cR.Y, 2.2f), MathF.Pow(cR.Z, 2.2f)),
+            new(MathF.Pow(cG.X, 2.2f), MathF.Pow(cG.Y, 2.2f), MathF.Pow(cG.Z, 2.2f)),
+            new(MathF.Pow(cB.X, 2.2f), MathF.Pow(cB.Y, 2.2f), MathF.Pow(cB.Z, 2.2f)),
+            new(MathF.Pow(cA.X, 2.2f), MathF.Pow(cA.Y, 2.2f), MathF.Pow(cA.Z, 2.2f)),
+        ];
+        Span<float> strengths = [cR.W, cG.W, cB.W, cA.W];
+        for (var y = 0; y < diffuse.Height; y++)
+        {
+            for (var x = 0; x < diffuse.Width; x++)
+            {
+                var p = diffuse[x, y];
+                var m = mask[x, y];
+                Span<byte> maskChannels = [m.R, m.G, m.B, m.A];
+                var r = MathF.Pow(p.R / 255f, 2.2f);
+                var g = MathF.Pow(p.G / 255f, 2.2f);
+                var b = MathF.Pow(p.B / 255f, 2.2f);
+                for (var c = 0; c < 4; c++)
+                {
+                    var w = maskChannels[c] / 255f * strengths[c];
+                    if (w <= 0f)
+                    {
+                        continue;
+                    }
+                    r += (r * tints[c].X - r) * w;
+                    g += (g * tints[c].Y - g) * w;
+                    b += (b * tints[c].Z - b) * w;
+                }
+                diffuse[x, y] = new Rgba32(
+                    (byte)(MathF.Pow(Math.Clamp(r, 0f, 1f), 1f / 2.2f) * 255f),
+                    (byte)(MathF.Pow(Math.Clamp(g, 0f, 1f), 1f / 2.2f) * 255f),
+                    (byte)(MathF.Pow(Math.Clamp(b, 0f, 1f), 1f / 2.2f) * 255f),
+                    p.A);
+            }
+        }
+        using var outStream = new MemoryStream();
+        diffuse.SaveAsPng(outStream);
+        return new MemoryImage(outStream.ToArray());
     }
 
     /// <summary>Unity color properties are sRGB; glTF color factors are linear.</summary>

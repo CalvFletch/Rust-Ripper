@@ -350,6 +350,9 @@ internal static class Cli
                         var texReport = session.TextureReport(q);
                         WriteJson(context, texReport != null ? 200 : 404, new { report = texReport });
                         break;
+                    case "/matscan":
+                        WriteJson(context, 200, new { report = session.MatScan() });
+                        break;
                     default:
                         WriteJson(context, 404, new { error = "unknown endpoint" });
                         break;
@@ -691,6 +694,74 @@ internal sealed class Session
                     if (slot.String.Contains("Normal", StringComparison.OrdinalIgnoreCase) || slot.String.Contains("Bump", StringComparison.OrdinalIgnoreCase))
                     {
                         sb.AppendLine($"      normal layout detected: {RipperMaterialFactory.DetectNormalLayout(img)}");
+                    }
+                }
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Inventory of every loaded material using a colour method: detail-layer
+    /// paint, colorize layers, vertex-color tint. Also lists every
+    /// ConstructionSkin_ColourLookup palette (building skin colours).
+    /// </summary>
+    public string MatScan()
+    {
+        var sb = new StringBuilder();
+        var count = 0;
+        sb.AppendLine("=== materials using colour methods (loaded bundles) ===");
+        foreach (var material in GameData.GameBundle.FetchAssets().OfType<IMaterial>())
+        {
+            float apply = 0, applyAlpha = 0, colorize = 0, detail = 0;
+            RustRipper.Core.RipperMaterialFactory.TryGetFloat(material, "_ApplyVertexColor", out apply);
+            RustRipper.Core.RipperMaterialFactory.TryGetFloat(material, "_ApplyVertexAlpha", out applyAlpha);
+            RustRipper.Core.RipperMaterialFactory.TryGetFloat(material, "_ColorizeLayer", out colorize);
+            RustRipper.Core.RipperMaterialFactory.TryGetFloat(material, "_DetailLayer", out detail);
+            var maskName = material.TryGetTextureProperty("_DetailMask", out var maskEnv)
+                && maskEnv.Texture.TryGetAsset(material.Collection) is AssetRipper.SourceGenerated.Classes.ClassID_28.ITexture2D maskTex
+                ? maskTex.Name.String : "";
+            var hasDetailPaint = detail != 0 && maskName.Length > 0;
+            if (apply == 0 && applyAlpha == 0 && colorize == 0 && !hasDetailPaint)
+            {
+                continue;
+            }
+            var shader = material.Shader_C21P?.Name.String ?? "?";
+            var flags = new List<string>();
+            if (apply != 0) { flags.Add("vertexColor"); }
+            if (applyAlpha != 0) { flags.Add("vertexAlpha"); }
+            if (colorize != 0)
+            {
+                RustRipper.Core.RipperMaterialFactory.TryGetFloat(material, "_ColorizeLayerEnabled", out var ce1);
+                RustRipper.Core.RipperMaterialFactory.TryGetFloat(material, "colorizeLayerEnabled", out var ce2);
+                flags.Add(ce1 != 0f || ce2 != 0f ? "colorize(ON)" : "colorize(off)");
+            }
+            if (hasDetailPaint) { flags.Add($"detailPaint mask={maskName}"); }
+            sb.AppendLine($"  {material.Name.String,-40} {shader,-44} {string.Join(", ", flags)}");
+            count++;
+        }
+        sb.AppendLine($"=== {count} materials ===");
+
+        foreach (var mono in GameData.GameBundle.FetchAssets().OfType<IMonoBehaviour>())
+        {
+            if (mono.ScriptP?.ClassName_R.String != "ConstructionSkin_ColourLookup")
+            {
+                continue;
+            }
+            sb.AppendLine($"palette: {mono.Name.String} ({mono.Collection.Name})");
+            if (mono.LoadStructure() is { } structure && structure.TryGetField("AllColours") is { } coloursField)
+            {
+                var i = 1;
+                foreach (var element in coloursField.AsAssetArray)
+                {
+                    if (element is AssetRipper.Import.Structure.Assembly.Serializable.SerializableStructure colour
+                        && colour.TryGetField("r") is { } r && colour.TryGetField("g") is { } g && colour.TryGetField("b") is { } b)
+                    {
+                        var rr = (int)(Math.Clamp(r.AsSingle, 0, 1) * 255);
+                        var gg = (int)(Math.Clamp(g.AsSingle, 0, 1) * 255);
+                        var bb = (int)(Math.Clamp(b.AsSingle, 0, 1) * 255);
+                        sb.AppendLine($"  #{i,-3} #{rr:x2}{gg:x2}{bb:x2}  ({r.AsSingle:F3}, {g.AsSingle:F3}, {b.AsSingle:F3})");
+                        i++;
                     }
                 }
             }
