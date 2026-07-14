@@ -33,7 +33,7 @@ dotnet build PrimeRustExtractor.sln -c Release
 dotnet run --project PrimeRustExtractor.Cli -- "<path-to-rust>\Bundles\shared\items.preload.bundle"
 ```
 
-Requires the .NET 9 SDK. The `--recursive` matters: the AssetRipper engine is a git submodule pinned to a known-good tag.
+Requires the .NET 9 SDK. The `--recursive` matters: the AssetRipper engine is a git submodule pinned to a known-good tag, and `dev_data/server` references the community-maintained decompiled Rust server source ([Zaddish/rust-changes](https://github.com/Zaddish/rust-changes)) used as schema documentation for game structures (LOD systems, manifests, item definitions).
 
 ## License
 

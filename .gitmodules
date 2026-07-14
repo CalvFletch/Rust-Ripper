@@ -1,3 +1,7 @@
 [submodule "external/AssetRipper"]
 	path = external/AssetRipper
 	url = https://github.com/AssetRipper/AssetRipper.git
+[submodule "dev_data/server"]
+	path = dev_data/server
+	url = https://github.com/Zaddish/rust-changes.git
+	branch = main
