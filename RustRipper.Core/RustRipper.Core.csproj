@@ -6,10 +6,22 @@
     <ProjectReference Include="..\external\AssetRipper\Source\AssetRipper.Export.UnityProjects\AssetRipper.Export.UnityProjects.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
+    <PackageReference Include="Krafs.Publicizer" Version="2.3.0" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- GlbSubMeshBuilder / GlbCoordinateConversion are internal to the engine's model export module -->
+    <Publicize Include="AssetRipper.Export.Modules.Models" />
+  </ItemGroup>
+
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- publicizer must rewrite the implementation dlls, not the stripped ref assemblies -->
+    <CompileUsingReferenceAssemblies>false</CompileUsingReferenceAssemblies>
   </PropertyGroup>
 
 </Project>

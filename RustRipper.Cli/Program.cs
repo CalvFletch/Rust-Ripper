@@ -146,18 +146,23 @@ internal static class Cli
         var queryParts = new List<string>();
         var outDir = "export";
         var extraBundles = new List<string>();
+        var options = new RipperGlbOptions();
         for (var i = 0; i < args.Length; i++)
         {
             switch (args[i])
             {
                 case "--out": outDir = args[++i]; break;
                 case "--bundles": extraBundles.Add(args[++i]); break;
+                case "--lod": options = options with { LodLevel = int.Parse(args[++i]) }; break;
+                case "--all-lods": options = options with { AllLods = true }; break;
+                case "--shadows": options = options with { IncludeShadowProxies = true }; break;
+                case "--no-prune": options = options with { PruneEmpties = false }; break;
                 default: queryParts.Add(args[i]); break;
             }
         }
         if (queryParts.Count == 0)
         {
-            Console.WriteLine("usage: ripper export <query> [--out <dir>] [--bundles <extra.bundle>]...");
+            Console.WriteLine("usage: ripper export <query> [--out <dir>] [--lod <n>] [--all-lods] [--shadows] [--no-prune] [--bundles <extra.bundle>]...");
             return 1;
         }
 
@@ -167,7 +172,7 @@ internal static class Cli
             return 1;
         }
         session = EnsureTextures(session, string.Join(' ', queryParts), extraBundles);
-        var result = session.ExportGlb(string.Join(' ', queryParts), outDir);
+        var result = session.ExportGlb(string.Join(' ', queryParts), outDir, options);
         Console.WriteLine(result.Message);
         return result.Success ? 0 : 1;
     }
@@ -479,7 +484,7 @@ internal sealed class Session
         }
     }
 
-    public (IEnumerable<IUnityObjectBase> Assets, string Name)? ResolveExportSet(string query)
+    public (IEnumerable<IUnityObjectBase> Assets, string Name, IGameObject Root)? ResolveExportSet(string query)
     {
         var entry = Resolve(query);
         if (entry == null)
@@ -493,7 +498,7 @@ internal sealed class Session
             .FirstOrDefault(h => h.Name.String.Equals(targetName, StringComparison.OrdinalIgnoreCase));
         if (hierarchy != null)
         {
-            return (hierarchy.Assets, targetName);
+            return (hierarchy.Assets, targetName, hierarchy.Root);
         }
 
         // Roots in the AssetScene-prefabs scene are named by their full prefab path.
@@ -502,13 +507,14 @@ internal sealed class Session
             ?? gameObjects.FirstOrDefault(go => (go.Name.String ?? "").Equals(targetName, StringComparison.OrdinalIgnoreCase));
         if (root != null)
         {
-            return (root.FetchHierarchy().Cast<IUnityObjectBase>(), targetName);
+            return (root.FetchHierarchy().Cast<IUnityObjectBase>(), targetName, root);
         }
         return null;
     }
 
-    public (bool Success, string Message, string? Path, double Seconds) ExportGlb(string query, string outDir, bool prune = true)
+    public (bool Success, string Message, string? Path, double Seconds) ExportGlb(string query, string outDir, RipperGlbOptions? options = null)
     {
+        options ??= new RipperGlbOptions();
         var resolved = ResolveExportSet(query);
         if (resolved == null)
         {
@@ -516,10 +522,17 @@ internal sealed class Session
         }
         Directory.CreateDirectory(outDir);
         var outPath = System.IO.Path.GetFullPath(System.IO.Path.Combine(outDir, $"{resolved.Value.Name}.glb"));
-        var exportAssets = prune ? PruneToMeshCarriers(resolved.Value.Assets) : resolved.Value.Assets;
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var ok = AssetRipper.Export.PrimaryContent.Models.GlbModelExporter.ExportModel(
-            exportAssets, outPath, false, LocalFileSystem.Instance);
+        var sceneBuilder = RipperGlbBuilder.Build(resolved.Value.Root, options);
+        bool ok;
+        using (var fileStream = File.Create(outPath))
+        {
+            ok = AssetRipper.Export.Modules.Models.GlbWriter.TryWrite(sceneBuilder, fileStream, out string? glbError);
+            if (!ok)
+            {
+                Logger.Error(glbError ?? "GLB write failed");
+            }
+        }
         sw.Stop();
         return ok && File.Exists(outPath)
             ? (true, $"exported in {sw.Elapsed.TotalSeconds:F1}s: {outPath} ({new FileInfo(outPath).Length / 1024} KB)", outPath, sw.Elapsed.TotalSeconds)
