@@ -172,6 +172,7 @@ internal static class Cli
                 case "--vertex-colors": options = options with { IncludeVertexColors = true }; break;
                 case "--paint-nodes": options = options with { PaintNodes = true }; break;
                 case "--no-lights": options = options with { IncludeLights = false }; break;
+                case "--keep-chains": options = options with { CollapseEmptyChains = false }; break;
                 default: queryParts.Add(args[i]); break;
             }
         }
@@ -467,6 +468,19 @@ internal sealed class Session
             Path.Combine(install.BundlesPath, "shared", "content.bundle"),
             .. extraBundles,
         ];
+        // Unity's built-in primitives (Cube, Sphere, Quad...) and default
+        // materials - Rust prefabs reference these constantly
+        foreach (var dataDir in new[] { "RustClient_Data", "RustClient_x64_Data", "Rust_Data" })
+        {
+            foreach (var builtin in new[] { "unity default resources", "unity_builtin_extra" })
+            {
+                var builtinPath = Path.Combine(install.GameRoot, dataDir, "Resources", builtin);
+                if (File.Exists(builtinPath))
+                {
+                    loadPaths.Add(builtinPath);
+                }
+            }
+        }
         loadPaths = loadPaths.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         GameData gameData = handler.LoadAndProcess(loadPaths, LocalFileSystem.Instance);
         Console.WriteLine($"session loaded in {sw.Elapsed.TotalSeconds:F1}s ({loadPaths.Count} bundles)");

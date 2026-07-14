@@ -48,6 +48,11 @@ public record RipperGlbOptions
     /// <summary>Export Unity Light components as real glTF lights
     /// (KHR_lights_punctual) — Blender imports them as lamps.</summary>
     public bool IncludeLights { get; init; } = true;
+
+    /// <summary>Collapse pass-through empties: a node with no mesh/light and
+    /// exactly one kept child contributes nothing but a transform, which gets
+    /// folded into that child. Branching nodes and the root survive.</summary>
+    public bool CollapseEmptyChains { get; init; } = true;
 }
 
 /// <summary>
@@ -283,6 +288,9 @@ public class RipperGlbBuilder
     // ---- the walk ----
 
     private void AddGameObject(SceneBuilder sceneBuilder, NodeBuilder? parentNode, ITransform transform)
+        => AddGameObject(sceneBuilder, parentNode, transform, System.Numerics.Matrix4x4.Identity);
+
+    private void AddGameObject(SceneBuilder sceneBuilder, NodeBuilder? parentNode, ITransform transform, System.Numerics.Matrix4x4 pending)
     {
         var gameObject = transform.GameObject_C4P;
         if (gameObject is null)
@@ -294,6 +302,21 @@ public class RipperGlbBuilder
             return;
         }
 
+        // combined local transform including any collapsed ancestors (glTF space)
+        var combined = LocalMatrixGltf(transform) * pending;
+
+        if (options.CollapseEmptyChains && parentNode is not null && !Contributes(gameObject))
+        {
+            var keptChildren = transform.Children_C4P.WhereNotNull()
+                .Where(ct => ct.GameObject_C4P is { } childGo && (!options.PruneEmpties || keep.Contains(childGo)))
+                .ToList();
+            if (keptChildren.Count == 1)
+            {
+                AddGameObject(sceneBuilder, parentNode, keptChildren[0], combined);
+                return;
+            }
+        }
+
         var node = parentNode is null ? new NodeBuilder(gameObject.Name) : parentNode.CreateNode(gameObject.Name);
         node.Extras = new JsonObject
         {
@@ -303,10 +326,7 @@ public class RipperGlbBuilder
         };
         if (parentNode is not null)
         {
-            node.LocalTransform = new SharpGLTF.Transforms.AffineTransform(
-                transform.LocalScale_C4.CastToStruct(),
-                GlbCoordinateConversion.ToGltfQuaternionConvert(transform.LocalRotation_C4),
-                GlbCoordinateConversion.ToGltfVector3Convert(transform.LocalPosition_C4));
+            node.LocalMatrix = combined;
         }
         sceneBuilder.AddNode(node);
 
@@ -334,7 +354,11 @@ public class RipperGlbBuilder
 
         if (options.IncludeLights && gameObject.TryGetComponent(out ILight? light))
         {
-            AddLight(sceneBuilder, node, light);
+            // leaf light nodes take the -Z flip inline instead of a wrapper child
+            var isLeaf = !EmitsGeometry(gameObject)
+                && !transform.Children_C4P.WhereNotNull().Any(ct =>
+                    ct.GameObject_C4P is { } childGo && (!options.PruneEmpties || keep.Contains(childGo)));
+            AddLight(sceneBuilder, node, light, isLeaf);
         }
 
         foreach (var childTransform in transform.Children_C4P.WhereNotNull())
@@ -343,13 +367,24 @@ public class RipperGlbBuilder
         }
     }
 
+    /// <summary>Local TRS as a glTF-space matrix (row-vector convention: S*R*T).</summary>
+    private static System.Numerics.Matrix4x4 LocalMatrixGltf(ITransform transform)
+    {
+        var scale = System.Numerics.Matrix4x4.CreateScale(transform.LocalScale_C4.CastToStruct());
+        var rotation = System.Numerics.Matrix4x4.CreateFromQuaternion(
+            GlbCoordinateConversion.ToGltfQuaternionConvert(transform.LocalRotation_C4));
+        var translation = System.Numerics.Matrix4x4.CreateTranslation(
+            GlbCoordinateConversion.ToGltfVector3Convert(transform.LocalPosition_C4));
+        return scale * rotation * translation;
+    }
+
     /// <summary>
     /// Unity Light -> KHR_lights_punctual. glTF lights emit along the node's
     /// -Z while Unity emits along +Z, so the light hangs off a child node
     /// rotated half a turn. Intensity: Unity's unitless value scaled to
     /// candela (rough visual match; the addon can rescale).
     /// </summary>
-    private static void AddLight(SceneBuilder sceneBuilder, NodeBuilder node, ILight light)
+    private static void AddLight(SceneBuilder sceneBuilder, NodeBuilder node, ILight light, bool inlineFlip)
     {
         var color = new System.Numerics.Vector3(light.Color.R, light.Color.G, light.Color.B);
         var candela = MathF.Max(light.Intensity, 0.01f) * 100f;
@@ -373,12 +408,18 @@ public class RipperGlbBuilder
         {
             return;
         }
+        var flip = System.Numerics.Matrix4x4.CreateFromQuaternion(
+            System.Numerics.Quaternion.CreateFromAxisAngle(System.Numerics.Vector3.UnitY, MathF.PI));
+        if (inlineFlip)
+        {
+            lightBuilder.Name = node.Name;
+            node.LocalMatrix = flip * node.LocalMatrix;
+            sceneBuilder.AddLight(lightBuilder, node);
+            return;
+        }
         lightBuilder.Name = node.Name + "_light";
         var lightNode = node.CreateNode(lightBuilder.Name);
-        lightNode.LocalTransform = new SharpGLTF.Transforms.AffineTransform(
-            System.Numerics.Vector3.One,
-            System.Numerics.Quaternion.CreateFromAxisAngle(System.Numerics.Vector3.UnitY, MathF.PI),
-            System.Numerics.Vector3.Zero);
+        lightNode.LocalMatrix = flip;
         sceneBuilder.AddLight(lightBuilder, lightNode);
     }
 
