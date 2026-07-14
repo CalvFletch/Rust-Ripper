@@ -157,12 +157,13 @@ internal static class Cli
                 case "--all-lods": options = options with { AllLods = true }; break;
                 case "--shadows": options = options with { IncludeShadowProxies = true }; break;
                 case "--no-prune": options = options with { PruneEmpties = false }; break;
+                case "--vertex-colors": options = options with { IncludeVertexColors = true }; break;
                 default: queryParts.Add(args[i]); break;
             }
         }
         if (queryParts.Count == 0)
         {
-            Console.WriteLine("usage: ripper export <query> [--out <dir>] [--lod <n>] [--all-lods] [--shadows] [--no-prune] [--bundles <extra.bundle>]...");
+            Console.WriteLine("usage: ripper export <query> [--out <dir>] [--lod <n>] [--all-lods] [--shadows] [--no-prune] [--vertex-colors] [--bundles <extra.bundle>]...");
             return 1;
         }
 

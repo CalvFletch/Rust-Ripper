@@ -41,15 +41,23 @@ public class RipperMaterialFactory
         var builder = new MaterialBuilder(material.Name).WithMetallicRoughnessShader();
         var shaderName = material.Shader_C21P?.Name.String ?? "";
         var isSpecularWorkflow = shaderName.Contains("Specular", StringComparison.OrdinalIgnoreCase);
+        builder.Extras = new System.Text.Json.Nodes.JsonObject
+        {
+            ["unity_material"] = material.Name.String,
+            ["unity_path_id"] = material.PathID,
+            ["unity_collection"] = material.Collection.Name,
+            ["unity_shader"] = shaderName,
+        };
 
         var floats = GetFloats(material);
         var colors = GetColors(material);
 
         // --- base color: _MainTex * _Color ---
         var baseColor = colors.TryGetValue("_Color", out var c) ? c : new System.Numerics.Vector4(1, 1, 1, 1);
-        if (TryGetImage(material, "raw", out var mainImage, "_MainTex", "_BaseColorMap", "_AlbedoMap"))
+        if (TryGetImage(material, "raw", out var mainImage, out var mainName, "_MainTex", "_BaseColorMap", "_AlbedoMap"))
         {
             builder.WithBaseColor(mainImage.Value, baseColor);
+            NameChannelImage(builder, KnownChannel.BaseColor, mainName);
         }
         else
         {
@@ -57,23 +65,26 @@ public class RipperMaterialFactory
         }
 
         // --- normal map (reconstructed from Unity's swizzled storage) ---
-        if (TryGetImage(material, "normal", out var normalImage, "_BumpMap", "_NormalMap", "_Normal"))
+        if (TryGetImage(material, "normal", out var normalImage, out var normalName, "_BumpMap", "_NormalMap", "_Normal"))
         {
             var scale = floats.TryGetValue("_BumpScale", out var bs) ? bs : 1f;
             builder.WithNormal(normalImage.Value, scale);
+            NameChannelImage(builder, KnownChannel.Normal, normalName);
         }
 
         // --- metallic / roughness ---
         var glossiness = floats.TryGetValue("_Glossiness", out var g) ? g
             : floats.TryGetValue("_Smoothness", out var s) ? s : 0.5f;
-        if (!isSpecularWorkflow && TryGetImage(material, "metalgloss", out var mrImage, "_MetallicGlossMap", "_PackedMap"))
+        if (!isSpecularWorkflow && TryGetImage(material, "metalgloss", out var mrImage, out var mrName, "_MetallicGlossMap", "_PackedMap"))
         {
             builder.WithMetallicRoughness(mrImage.Value, 1f, 1f);
+            NameChannelImage(builder, KnownChannel.MetallicRoughness, mrName);
         }
-        else if (isSpecularWorkflow && TryGetImage(material, "specgloss", out var sgImage, "_SpecGlossMap", "_SpecularMap"))
+        else if (isSpecularWorkflow && TryGetImage(material, "specgloss", out var sgImage, out var sgName, "_SpecGlossMap", "_SpecularMap"))
         {
             // approximation: gloss alpha becomes roughness, non-metal
             builder.WithMetallicRoughness(sgImage.Value, 0f, 1f);
+            NameChannelImage(builder, KnownChannel.MetallicRoughness, sgName);
         }
         else
         {
@@ -82,18 +93,20 @@ public class RipperMaterialFactory
         }
 
         // --- occlusion ---
-        if (TryGetImage(material, "raw", out var occlusionImage, "_OcclusionMap"))
+        if (TryGetImage(material, "raw", out var occlusionImage, out var occlusionName, "_OcclusionMap"))
         {
             var strength = floats.TryGetValue("_OcclusionStrength", out var os) ? os : 1f;
             builder.WithOcclusion(occlusionImage.Value, strength);
+            NameChannelImage(builder, KnownChannel.Occlusion, occlusionName);
         }
 
         // --- emission ---
         if (colors.TryGetValue("_EmissionColor", out var emission) && (emission.X > 0 || emission.Y > 0 || emission.Z > 0))
         {
-            if (TryGetImage(material, "raw", out var emissionImage, "_EmissionMap"))
+            if (TryGetImage(material, "raw", out var emissionImage, out var emissionName, "_EmissionMap"))
             {
                 builder.WithEmissive(emissionImage.Value, new System.Numerics.Vector3(emission.X, emission.Y, emission.Z));
+                NameChannelImage(builder, KnownChannel.Emissive, emissionName);
             }
             else
             {
@@ -101,14 +114,35 @@ public class RipperMaterialFactory
             }
         }
 
-        // --- alpha cutout (Unity standard: _Mode 1 = cutout) ---
-        if (floats.TryGetValue("_Mode", out var mode) && (int)mode == 1)
+        // --- alpha (Unity standard _Mode: 0 opaque, 1 cutout, 2 fade, 3 transparent) ---
+        if (floats.TryGetValue("_Mode", out var mode))
         {
-            var cutoff = floats.TryGetValue("_Cutoff", out var co) ? co : 0.5f;
-            builder.WithAlpha(AlphaMode.MASK, cutoff);
+            switch ((int)mode)
+            {
+                case 1:
+                    var cutoff = floats.TryGetValue("_Cutoff", out var co) ? co : 0.5f;
+                    builder.WithAlpha(AlphaMode.MASK, cutoff);
+                    break;
+                case 2 or 3:
+                    builder.WithAlpha(AlphaMode.BLEND);
+                    break;
+            }
         }
 
         return builder;
+    }
+
+    private static void NameChannelImage(MaterialBuilder builder, KnownChannel channel, string? name)
+    {
+        if (string.IsNullOrEmpty(name))
+        {
+            return;
+        }
+        var image = builder.GetChannel(channel)?.Texture?.PrimaryImage;
+        if (image is not null)
+        {
+            image.Name = name;
+        }
     }
 
     /// <summary>
@@ -118,9 +152,10 @@ public class RipperMaterialFactory
     /// metalgloss- Unity R=metal A=smoothness -> glTF G=roughness B=metal
     /// specgloss - Unity RGB=spec A=gloss     -> glTF G=roughness (approximation)
     /// </summary>
-    private bool TryGetImage(IMaterial material, string mode, [NotNullWhen(true)] out MemoryImage? image, params string[] slotNames)
+    private bool TryGetImage(IMaterial material, string mode, [NotNullWhen(true)] out MemoryImage? image, out string? textureName, params string[] slotNames)
     {
         image = null;
+        textureName = null;
         foreach (var slot in slotNames)
         {
             if (!material.TryGetTextureProperty(slot, out var texEnv))
@@ -139,6 +174,7 @@ public class RipperMaterialFactory
             }
             if (image is not null)
             {
+                textureName = texture.Name;
                 return true;
             }
         }

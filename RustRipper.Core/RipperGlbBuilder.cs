@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Text.Json.Nodes;
 using AssetRipper.Assets;
 using AssetRipper.Assets.Generics;
 using AssetRipper.Export.Modules.Models;
@@ -30,6 +31,10 @@ public record RipperGlbOptions
     public bool AllLods { get; init; } = false;
     public bool IncludeShadowProxies { get; init; } = false;
     public bool PruneEmpties { get; init; } = true;
+
+    /// <summary>Rust stores shader mask data (wind weights, AO) in vertex colors,
+    /// not tint — glTF viewers multiply COLOR_0 into base color, blackening meshes.</summary>
+    public bool IncludeVertexColors { get; init; } = false;
 }
 
 /// <summary>
@@ -200,6 +205,12 @@ public class RipperGlbBuilder
         }
 
         var node = parentNode is null ? new NodeBuilder(gameObject.Name) : parentNode.CreateNode(gameObject.Name);
+        node.Extras = new JsonObject
+        {
+            ["unity_game_object"] = gameObject.Name.String,
+            ["unity_path_id"] = gameObject.PathID,
+            ["unity_collection"] = gameObject.Collection.Name,
+        };
         if (parentNode is not null)
         {
             node.LocalTransform = new SharpGLTF.Transforms.AffineTransform(
@@ -245,6 +256,10 @@ public class RipperGlbBuilder
         }
         if (MeshData.TryMakeFromMesh(mesh, out meshData))
         {
+            if (!options.IncludeVertexColors)
+            {
+                meshData = meshData with { Colors = null };
+            }
             meshCache.Add(mesh, meshData);
             return true;
         }
@@ -279,6 +294,16 @@ public class RipperGlbBuilder
         IMeshBuilder<MaterialBuilder> meshBuilder = GlbSubMeshBuilder.BuildSubMeshes(
             new ArraySegment<(ISubMesh, MaterialBuilder)>(pairs), mesh.Is16BitIndices(), meshData,
             Transformation.Identity, Transformation.Identity);
+        if (meshBuilder is SharpGLTF.BaseBuilder baseBuilder)
+        {
+            baseBuilder.Name = mesh.Name.String;
+            baseBuilder.Extras = new JsonObject
+            {
+                ["unity_mesh"] = mesh.Name.String,
+                ["unity_path_id"] = mesh.PathID,
+                ["unity_collection"] = mesh.Collection.Name,
+            };
+        }
         sceneBuilder.AddRigidMesh(meshBuilder, node);
     }
 }
