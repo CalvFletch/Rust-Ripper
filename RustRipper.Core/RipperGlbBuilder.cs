@@ -7,6 +7,7 @@ using AssetRipper.Import.Structure.Assembly;
 using AssetRipper.Import.Structure.Assembly.Serializable;
 using AssetRipper.Numerics;
 using AssetRipper.SourceGenerated.Classes.ClassID_1;
+using AssetRipper.SourceGenerated.Classes.ClassID_108;
 using AssetRipper.SourceGenerated.Classes.ClassID_114;
 using AssetRipper.SourceGenerated.Classes.ClassID_137;
 using AssetRipper.SourceGenerated.Classes.ClassID_205;
@@ -43,6 +44,10 @@ public record RipperGlbOptions
     /// raw, the _DetailMask textures are written as PNGs next to the GLB, and
     /// _RUST_PAINT carries the colour — the addon builds mask-driven Mix nodes.</summary>
     public bool PaintNodes { get; init; } = false;
+
+    /// <summary>Export Unity Light components as real glTF lights
+    /// (KHR_lights_punctual) — Blender imports them as lamps.</summary>
+    public bool IncludeLights { get; init; } = true;
 }
 
 /// <summary>
@@ -246,13 +251,17 @@ public class RipperGlbBuilder
             {
                 continue;
             }
-            if (gameObject.FetchHierarchy().OfType<IGameObject>().Any(EmitsGeometry))
+            if (gameObject.FetchHierarchy().OfType<IGameObject>().Any(Contributes))
             {
                 // ancestors are implied: their subtrees contain the same renderer
                 keep.Add(gameObject);
             }
         }
     }
+
+    private bool Contributes(IGameObject gameObject)
+        => EmitsGeometry(gameObject)
+        || (options.IncludeLights && gameObject.TryGetComponent(out ILight? _));
 
     private bool EmitsGeometry(IGameObject gameObject)
     {
@@ -323,10 +332,54 @@ public class RipperGlbBuilder
             AddMesh(sceneBuilder, node, skinnedMesh, skinnedData, skinned);
         }
 
+        if (options.IncludeLights && gameObject.TryGetComponent(out ILight? light))
+        {
+            AddLight(sceneBuilder, node, light);
+        }
+
         foreach (var childTransform in transform.Children_C4P.WhereNotNull())
         {
             AddGameObject(sceneBuilder, node, childTransform);
         }
+    }
+
+    /// <summary>
+    /// Unity Light -> KHR_lights_punctual. glTF lights emit along the node's
+    /// -Z while Unity emits along +Z, so the light hangs off a child node
+    /// rotated half a turn. Intensity: Unity's unitless value scaled to
+    /// candela (rough visual match; the addon can rescale).
+    /// </summary>
+    private static void AddLight(SceneBuilder sceneBuilder, NodeBuilder node, ILight light)
+    {
+        var color = new System.Numerics.Vector3(light.Color.R, light.Color.G, light.Color.B);
+        var candela = MathF.Max(light.Intensity, 0.01f) * 100f;
+        var outerCone = Math.Clamp(light.SpotAngle * MathF.PI / 360f, 0.01f, MathF.PI / 2f - 0.001f);
+        var innerCone = Math.Clamp(light.InnerSpotAngle * MathF.PI / 360f, 0f, outerCone - 0.001f);
+        LightBuilder? lightBuilder = light.Type switch
+        {
+            2 => new LightBuilder.Point { Color = color, Intensity = candela, Range = light.Range },
+            0 => new LightBuilder.Spot
+            {
+                Color = color,
+                Intensity = candela,
+                Range = light.Range,
+                OuterConeAngle = outerCone,
+                InnerConeAngle = innerCone,
+            },
+            1 => new LightBuilder.Directional { Color = color, Intensity = MathF.Max(light.Intensity, 0.01f) },
+            _ => null,
+        };
+        if (lightBuilder is null)
+        {
+            return;
+        }
+        lightBuilder.Name = node.Name + "_light";
+        var lightNode = node.CreateNode(lightBuilder.Name);
+        lightNode.LocalTransform = new SharpGLTF.Transforms.AffineTransform(
+            System.Numerics.Vector3.One,
+            System.Numerics.Quaternion.CreateFromAxisAngle(System.Numerics.Vector3.UnitY, MathF.PI),
+            System.Numerics.Vector3.Zero);
+        sceneBuilder.AddLight(lightBuilder, lightNode);
     }
 
     private bool TryGetMeshData(IMesh mesh, out MeshData meshData)

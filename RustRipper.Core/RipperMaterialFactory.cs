@@ -304,6 +304,14 @@ public class RipperMaterialFactory
             }
         }
 
+        // --- glass (KHR_materials_transmission) ---
+        // the shader IS the method: refraction shaders are transmissive glass
+        if (shaderName.Contains("Refraction", StringComparison.OrdinalIgnoreCase)
+            || shaderName.Contains("Glass", StringComparison.OrdinalIgnoreCase))
+        {
+            builder.WithChannelParam(KnownChannel.Transmission, KnownProperty.TransmissionFactor, 0.9f);
+        }
+
         return builder;
     }
 

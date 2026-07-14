@@ -171,6 +171,7 @@ internal static class Cli
                 case "--no-prune": options = options with { PruneEmpties = false }; break;
                 case "--vertex-colors": options = options with { IncludeVertexColors = true }; break;
                 case "--paint-nodes": options = options with { PaintNodes = true }; break;
+                case "--no-lights": options = options with { IncludeLights = false }; break;
                 default: queryParts.Add(args[i]); break;
             }
         }
