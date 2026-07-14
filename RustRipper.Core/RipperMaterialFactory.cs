@@ -42,12 +42,38 @@ public class RipperMaterialFactory
         var builder = new MaterialBuilder(material.Name).WithMetallicRoughnessShader();
         var shaderName = material.Shader_C21P?.Name.String ?? "";
         var isSpecularWorkflow = shaderName.Contains("Specular", StringComparison.OrdinalIgnoreCase);
+        var floats = GetFloats(material);
+        var colors = GetColors(material);
+
+        // Everything the game material holds rides along as extras (Blender
+        // custom properties): what glTF can't express is still never lost.
+        var floatsJson = new System.Text.Json.Nodes.JsonObject();
+        foreach (var (key, value) in floats)
+        {
+            floatsJson[key] = value;
+        }
+        var colorsJson = new System.Text.Json.Nodes.JsonObject();
+        foreach (var (key, value) in colors)
+        {
+            colorsJson[key] = new System.Text.Json.Nodes.JsonArray(value.X, value.Y, value.Z, value.W);
+        }
+        var texturesJson = new System.Text.Json.Nodes.JsonObject();
+        foreach (var (slot, texEnv) in material.GetTextureProperties())
+        {
+            if (texEnv.Texture.TryGetAsset(material.Collection) is ITexture2D slotTexture)
+            {
+                texturesJson[slot.String] = slotTexture.Name.String;
+            }
+        }
         builder.Extras = new System.Text.Json.Nodes.JsonObject
         {
             ["unity_material"] = material.Name.String,
             ["unity_path_id"] = material.PathID,
             ["unity_collection"] = material.Collection.Name,
             ["unity_shader"] = shaderName,
+            ["unity_floats"] = floatsJson,
+            ["unity_colors"] = colorsJson,
+            ["unity_textures"] = texturesJson,
         };
 
         // Additive shaders (particle glows like animal night-eyes) are not lit
@@ -64,9 +90,6 @@ public class RipperMaterialFactory
             }
             return builder;
         }
-
-        var floats = GetFloats(material);
-        var colors = GetColors(material);
 
         // --- base color: _MainTex * _Color ---
         // Fur shells (AnimalFur) keep their density mask in _FuzzMask: composite
@@ -112,23 +135,48 @@ public class RipperMaterialFactory
         }
 
         // --- metallic / roughness ---
+        // Unity: smoothness lives in the gloss map's alpha, scaled by
+        // _GlossMapScale; with _SmoothnessTextureChannel=1 it lives in the
+        // albedo's alpha instead. The scale is baked into the converted texture
+        // (exact), factors only carry constants.
         var glossiness = floats.TryGetValue("_Glossiness", out var g) ? g
             : floats.TryGetValue("_Smoothness", out var s) ? s : 0.5f;
-        if (!isSpecularWorkflow && TryGetImage(material, "metalgloss", out var mrImage, out var mrName, "_MetallicGlossMap", "_PackedMap"))
+        var glossMapScale = floats.TryGetValue("_GlossMapScale", out var gms) ? gms : 1f;
+        var metallic = isSpecularWorkflow ? 0f : (floats.TryGetValue("_Metallic", out var met) ? met : 0f);
+        var smoothnessFromAlbedo = floats.TryGetValue("_SmoothnessTextureChannel", out var stc) && (int)stc == 1;
+        if (!isSpecularWorkflow && TryGetImage(material, $"metalgloss:{glossMapScale:F3}", out var mrImage, out var mrName, "_MetallicGlossMap", "_PackedMap"))
         {
             builder.WithMetallicRoughness(mrImage.Value, 1f, 1f);
             NameChannelImage(builder, KnownChannel.MetallicRoughness, mrName);
         }
-        else if (TryGetImage(material, "specgloss", out var sgImage, out var sgName, "_SpecGlossMap", "_SpecularMap", "_Specular"))
+        else if (TryGetImage(material, $"specgloss:{glossMapScale:F3}", out var sgImage, out var sgName, "_SpecGlossMap", "_SpecularMap", "_Specular"))
         {
             // approximation: gloss alpha becomes roughness, non-metal
             builder.WithMetallicRoughness(sgImage.Value, 0f, 1f);
             NameChannelImage(builder, KnownChannel.MetallicRoughness, sgName);
         }
+        else if (smoothnessFromAlbedo && diffuseTexture is not null
+            && TryGetImage(material, $"albedogloss:{glossMapScale:F3}", out var agImage, out var agName, "_MainTex", "_BaseColorMap", "_AlbedoMap", "_Diffuse"))
+        {
+            builder.WithMetallicRoughness(agImage.Value, metallic, 1f);
+            NameChannelImage(builder, KnownChannel.MetallicRoughness, agName);
+        }
         else
         {
-            var metallic = isSpecularWorkflow ? 0f : (floats.TryGetValue("_Metallic", out var m) ? m : 0f);
             builder.WithMetallicRoughness(metallic, 1f - glossiness);
+        }
+
+        // --- culling ---
+        if ((floats.TryGetValue("_Cull", out var cull) && (int)cull == 0)
+            || (floats.TryGetValue("_DoubleSided", out var doubleSided) && doubleSided != 0f))
+        {
+            builder.WithDoubleSide(true);
+        }
+
+        // --- index of refraction (KHR_materials_ior) ---
+        if (floats.TryGetValue("_Ior", out var ior) && ior > 0f)
+        {
+            builder.IndexOfRefraction = ior;
         }
 
         // --- occlusion ---
@@ -139,17 +187,23 @@ public class RipperMaterialFactory
             NameChannelImage(builder, KnownChannel.Occlusion, occlusionName);
         }
 
-        // --- emission ---
+        // --- emission (HDR intensity goes to KHR_materials_emissive_strength) ---
         if (colors.TryGetValue("_EmissionColor", out var emission) && (emission.X > 0 || emission.Y > 0 || emission.Z > 0))
         {
+            var strength = MathF.Max(1f, MathF.Max(emission.X, MathF.Max(emission.Y, emission.Z)));
+            var emissiveRgb = new System.Numerics.Vector3(emission.X, emission.Y, emission.Z) / strength;
             if (TryGetImage(material, "raw", out var emissionImage, out var emissionName, "_EmissionMap"))
             {
-                builder.WithEmissive(emissionImage.Value, new System.Numerics.Vector3(emission.X, emission.Y, emission.Z));
+                builder.WithEmissive(emissionImage.Value, emissiveRgb);
                 NameChannelImage(builder, KnownChannel.Emissive, emissionName);
             }
             else
             {
-                builder.WithEmissive(new System.Numerics.Vector3(emission.X, emission.Y, emission.Z));
+                builder.WithEmissive(emissiveRgb);
+            }
+            if (strength > 1f)
+            {
+                builder.WithChannelParam(KnownChannel.Emissive, KnownProperty.EmissiveStrength, strength);
             }
         }
 
@@ -281,9 +335,19 @@ public class RipperMaterialFactory
             return new MemoryImage(pngStream.ToArray());
         }
 
+        // mode may carry a smoothness scale suffix, e.g. "metalgloss:0.850"
+        var scale = 1f;
+        var baseMode = mode;
+        var colonIndex = mode.IndexOf(':');
+        if (colonIndex >= 0)
+        {
+            baseMode = mode[..colonIndex];
+            scale = float.Parse(mode[(colonIndex + 1)..], System.Globalization.CultureInfo.InvariantCulture);
+        }
+
         pngStream.Position = 0;
         using var img = Image.Load<Rgba32>(pngStream);
-        var normalSource = mode == "normal" ? DetectNormalXSource(img) : NormalXSource.Red;
+        var normalSource = baseMode == "normal" ? DetectNormalXSource(img) : NormalXSource.Red;
         img.ProcessPixelRows(accessor =>
         {
             for (var y = 0; y < accessor.Height; y++)
@@ -292,11 +356,12 @@ public class RipperMaterialFactory
                 for (var x = 0; x < row.Length; x++)
                 {
                     var p = row[x];
-                    row[x] = mode switch
+                    row[x] = baseMode switch
                     {
                         "normal" => ReconstructNormal(p, normalSource),
-                        "metalgloss" => new Rgba32(0, (byte)(255 - p.A), p.R, 255),
-                        "specgloss" => new Rgba32(0, (byte)(255 - p.A), 0, 255),
+                        "metalgloss" => new Rgba32(0, Roughness(p.A, scale), p.R, 255),
+                        "specgloss" => new Rgba32(0, Roughness(p.A, scale), 0, 255),
+                        "albedogloss" => new Rgba32(0, Roughness(p.A, scale), 255, 255),
                         _ => p,
                     };
                 }
@@ -306,6 +371,10 @@ public class RipperMaterialFactory
         img.SaveAsPng(outStream);
         return new MemoryImage(outStream.ToArray());
     }
+
+    /// <summary>Unity smoothness (texture alpha x scale) to glTF roughness.</summary>
+    private static byte Roughness(byte smoothness, float scale)
+        => (byte)Math.Clamp(255f - smoothness * scale, 0f, 255f);
 
     private enum NormalXSource { Red, Alpha }
 
