@@ -168,7 +168,15 @@ public class RipperMaterialFactory
         var glossMapScale = floats.TryGetValue("_GlossMapScale", out var gms) ? gms : 1f;
         var metallic = isSpecularWorkflow ? 0f : (floats.TryGetValue("_Metallic", out var met) ? met : 0f);
         var smoothnessFromAlbedo = floats.TryGetValue("_SmoothnessTextureChannel", out var stc) && (int)stc == 1;
-        if (!isSpecularWorkflow && TryGetImage(material, $"metalgloss:{glossMapScale:F3}", out var mrImage, out var mrName, "_MetallicGlossMap", "_PackedMap"))
+        if (TryGetImage(material, $"packedmap:{glossMapScale:F3}", out var pmImage, out var pmName, "_PackedMap"))
+        {
+            // Rust _PackedMap: G=glossiness, B=metallic, A=AO -> glTF ORM in one image
+            builder.WithMetallicRoughness(pmImage.Value, 1f, 1f);
+            NameChannelImage(builder, KnownChannel.MetallicRoughness, pmName);
+            builder.WithOcclusion(pmImage.Value, floats.TryGetValue("_OcclusionStrength", out var pmOcc) ? pmOcc : 1f);
+            NameChannelImage(builder, KnownChannel.Occlusion, pmName);
+        }
+        else if (!isSpecularWorkflow && TryGetImage(material, $"metalgloss:{glossMapScale:F3}", out var mrImage, out var mrName, "_MetallicGlossMap"))
         {
             builder.WithMetallicRoughness(mrImage.Value, 1f, 1f);
             NameChannelImage(builder, KnownChannel.MetallicRoughness, mrName);
@@ -462,6 +470,7 @@ public class RipperMaterialFactory
                         "metalgloss" => new Rgba32(0, Roughness(p.A, scale), p.R, 255),
                         "specgloss" => new Rgba32(0, Roughness(p.A, scale), 0, 255),
                         "albedogloss" => new Rgba32(0, Roughness(p.A, scale), 255, 255),
+                        "packedmap" => new Rgba32(p.A, Roughness(p.G, scale), p.B, 255),
                         _ => p,
                     };
                 }
@@ -480,29 +489,33 @@ public class RipperMaterialFactory
 
     /// <summary>
     /// Unity stores tangent normals swizzled by format: DXT5nm keeps X in alpha
-    /// (AssetRipper unpacks flagged ones already), BC5 keeps X/Y in R/G with an
-    /// opaque alpha. Decide once per image, not per pixel: a varying alpha
-    /// channel means the X data lives there.
+    /// with a CONSTANT red channel; BC5/plain keep X in red. Decide once per
+    /// image: only a flat red channel plus a varying alpha means DXT5nm — a
+    /// varying alpha alone can be unrelated packed data riding in A.
     /// </summary>
     private static NormalXSource DetectNormalXSource(Image<Rgba32> img)
     {
+        byte rMin = 255, rMax = 0;
         var alphaVaries = false;
         img.ProcessPixelRows(accessor =>
         {
-            for (var y = 0; y < accessor.Height && !alphaVaries; y++)
+            for (var y = 0; y < accessor.Height; y++)
             {
                 var row = accessor.GetRowSpan(y);
                 for (var x = 0; x < row.Length; x++)
                 {
-                    if (row[x].A is > 8 and < 247)
+                    var p = row[x];
+                    if (p.R < rMin) { rMin = p.R; }
+                    if (p.R > rMax) { rMax = p.R; }
+                    if (p.A is > 8 and < 247)
                     {
                         alphaVaries = true;
-                        break;
                     }
                 }
             }
         });
-        return alphaVaries ? NormalXSource.Alpha : NormalXSource.Red;
+        var redIsFlat = rMax - rMin <= 24;
+        return redIsFlat && alphaVaries ? NormalXSource.Alpha : NormalXSource.Red;
     }
 
     private static Rgba32 ReconstructNormal(Rgba32 p, NormalXSource source)

@@ -23,6 +23,7 @@ return args.FirstOrDefault() switch
     "find" => Cli.Find(args[1..]),
     "export" => Cli.Export(args[1..]),
     "mat" => Cli.Mat(args[1..]),
+    "texstat" => Cli.TexStat(args[1..]),
     "serve" => Cli.Serve(args[1..]),
     "stats" => Cli.Stats(args[1..]),
     _ => Cli.Usage(),
@@ -248,6 +249,38 @@ internal static class Cli
         return report != null ? 0 : 1;
     }
 
+    public static int TexStat(string[] args)
+    {
+        var queryParts = new List<string>();
+        var extraBundles = new List<string>();
+        for (var i = 0; i < args.Length; i++)
+        {
+            if (args[i] == "--bundles")
+            {
+                if (FlagValue(args, ref i) is { } b) { extraBundles.Add(b); }
+            }
+            else
+            {
+                queryParts.Add(args[i]);
+            }
+        }
+        if (queryParts.Count == 0)
+        {
+            Console.WriteLine("usage: ripper texstat <query> [--bundles <extra.bundle>]");
+            return 1;
+        }
+
+        var session = Session.Start(extraBundles);
+        if (session == null)
+        {
+            return 1;
+        }
+        session = EnsureTextures(session, string.Join(' ', queryParts), extraBundles);
+        var report = session.TextureReport(string.Join(' ', queryParts));
+        Console.WriteLine(report ?? "no match");
+        return report != null ? 0 : 1;
+    }
+
     public static int Serve(string[] args)
     {
         var port = 17071;
@@ -311,6 +344,11 @@ internal static class Cli
                     case "/mat":
                         var report = session.MaterialReport(q);
                         WriteJson(context, report != null ? 200 : 404, new { report });
+                        break;
+                    case "/texstat":
+                        session = Cli.EnsureTextures(session, q, session.LoadedBundles.ToList());
+                        var texReport = session.TextureReport(q);
+                        WriteJson(context, texReport != null ? 200 : 404, new { report = texReport });
                         break;
                     default:
                         WriteJson(context, 404, new { error = "unknown endpoint" });
@@ -584,6 +622,83 @@ internal sealed class Session
         return ok && File.Exists(outPath)
             ? (true, $"exported in {sw.Elapsed.TotalSeconds:F1}s: {outPath} ({new FileInfo(outPath).Length / 1024} KB)", outPath, sw.Elapsed.TotalSeconds)
             : (false, "export failed", null, sw.Elapsed.TotalSeconds);
+    }
+
+    /// <summary>
+    /// Raw per-channel statistics of every texture the target's materials use,
+    /// straight from the decoded game data. Ground truth for channel-packing
+    /// questions (where does X live in a normal map, what's in the alpha).
+    /// </summary>
+    public string? TextureReport(string query)
+    {
+        var resolved = ResolveExportSet(query);
+        if (resolved == null)
+        {
+            return null;
+        }
+        var sb = new StringBuilder();
+        sb.AppendLine($"=== texture channels for {resolved.Value.Name} ===");
+        var seen = new HashSet<AssetRipper.SourceGenerated.Classes.ClassID_28.ITexture2D>();
+        foreach (var renderer in resolved.Value.Assets.OfType<IRenderer>())
+        {
+            foreach (var materialPtr in renderer.Materials_C25)
+            {
+                if (!materialPtr.TryGetAsset(renderer.Collection, out IMaterial? material))
+                {
+                    continue;
+                }
+                foreach (var (slot, texEnv) in material.GetTextureProperties())
+                {
+                    if (texEnv.Texture.TryGetAsset(material.Collection) is not AssetRipper.SourceGenerated.Classes.ClassID_28.ITexture2D texture
+                        || !seen.Add(texture))
+                    {
+                        continue;
+                    }
+                    if (!AssetRipper.Export.Modules.Textures.TextureConverter.TryConvertToBitmap(texture, out var bitmap))
+                    {
+                        sb.AppendLine($"  {slot.String,-26} {texture.Name.String,-30} DECODE FAILED ({texture.Format_C28E})");
+                        continue;
+                    }
+                    // DirectBitmap layout is BGRA
+                    var bits = bitmap.Bits;
+                    var mins = new byte[] { 255, 255, 255, 255 };
+                    var maxs = new byte[4];
+                    var sums = new long[4];
+                    long count = 0;
+                    double zErrFromRed = 0, zErrFromAlpha = 0;
+                    for (var i = 0; i + 3 < bits.Length; i += 4 * 7)  // sample every 7th pixel
+                    {
+                        for (var ch = 0; ch < 4; ch++)
+                        {
+                            var v = bits[i + ch];
+                            if (v < mins[ch]) { mins[ch] = v; }
+                            if (v > maxs[ch]) { maxs[ch] = v; }
+                            sums[ch] += v;
+                        }
+                        // normal-map self test: which XY source reproduces the stored Z (blue)?
+                        var yN = bits[i + 1] / 255f * 2f - 1f;
+                        zErrFromRed += Math.Abs(bits[i] - PredictZ(bits[i + 2] / 255f * 2f - 1f, yN));
+                        zErrFromAlpha += Math.Abs(bits[i] - PredictZ(bits[i + 3] / 255f * 2f - 1f, yN));
+                        count++;
+                    }
+                    string Ch(int bgraIndex) => $"{mins[bgraIndex]}..{maxs[bgraIndex]} ~{(count > 0 ? sums[bgraIndex] / count : 0)}";
+                    sb.AppendLine($"  {slot.String,-26} {texture.Name.String,-30} {texture.Width_C28}x{texture.Height_C28} {texture.Format_C28E}");
+                    sb.AppendLine($"      R {Ch(2),-16} G {Ch(1),-16} B {Ch(0),-16} A {Ch(3)}");
+                    if (count > 0)
+                    {
+                        sb.AppendLine($"      normal-Z self test: err(X=R)={zErrFromRed / count:F1} err(X=A)={zErrFromAlpha / count:F1} (small err = that channel is X)");
+                    }
+                }
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Stored-Z prediction for tangent normals encoded as (n+1)/2*255.</summary>
+    private static float PredictZ(float x, float y)
+    {
+        var zSq = 1f - Math.Clamp(x * x + y * y, 0f, 1f);
+        return (MathF.Sqrt(zSq) + 1f) / 2f * 255f;
     }
 
     /// <summary>
