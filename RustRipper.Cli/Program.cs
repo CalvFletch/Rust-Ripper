@@ -372,6 +372,11 @@ internal static class Cli
                         var fieldsReport = session.FieldsReport(q, request.QueryString["cls"]);
                         WriteJson(context, fieldsReport != null ? 200 : 404, new { report = fieldsReport });
                         break;
+                    case "/texdump":
+                        var texOut = request.QueryString["out"] ?? "export";
+                        var dumped = session.DumpTexture(q, texOut);
+                        WriteJson(context, dumped != null ? 200 : 404, new { path = dumped });
+                        break;
                     case "/hier":
                         var hierReport = session.HierarchyReport(q);
                         WriteJson(context, hierReport != null ? 200 : 404, new { report = hierReport });
@@ -935,6 +940,23 @@ internal sealed class Session
         }
         Walk(resolved.Value.Root.GetTransform(), 0);
         return sb.ToString();
+    }
+
+    /// <summary>Decode any loaded texture by asset name to a PNG on disk
+    /// (extras-referenced textures like detail albedos and light cookies).</summary>
+    public string? DumpTexture(string textureName, string outDir)
+    {
+        var texture = GameData.GameBundle.FetchAssets()
+            .OfType<AssetRipper.SourceGenerated.Classes.ClassID_28.ITexture2D>()
+            .FirstOrDefault(t => t.Name.String.Equals(textureName, StringComparison.OrdinalIgnoreCase));
+        if (texture is null || !RipperMaterialFactory.TryDecodePng(texture, out var png))
+        {
+            return null;
+        }
+        Directory.CreateDirectory(outDir);
+        var path = System.IO.Path.GetFullPath(System.IO.Path.Combine(outDir, $"{texture.Name.String}.png"));
+        File.WriteAllBytes(path, png);
+        return path;
     }
 
     private Dictionary<string, string>? guidToPath;
