@@ -308,6 +308,7 @@ public class RipperMaterialFactory
         }
 
         // --- alpha (Unity standard _Mode: 0 opaque, 1 cutout, 2 fade, 3 transparent) ---
+        var alphaSet = false;
         if (floats.TryGetValue("_Mode", out var mode))
         {
             switch ((int)mode)
@@ -315,11 +316,30 @@ public class RipperMaterialFactory
                 case 1:
                     var cutoff = floats.TryGetValue("_Cutoff", out var co) ? co : 0.5f;
                     builder.WithAlpha(AlphaMode.MASK, cutoff);
+                    alphaSet = true;
                     break;
                 case 2 or 3:
                     builder.WithAlpha(AlphaMode.BLEND);
+                    alphaSet = true;
                     break;
             }
+        }
+        // shaders without _Mode (particles, custom): the render state itself
+        // says transparent - depth write off + over blending (rotor blur planes)
+        if (!alphaSet && blend is { } transparentState
+            && transparentState.ZWrite == 0f && transparentState.Dst == 10f)
+        {
+            builder.WithAlpha(AlphaMode.BLEND);
+        }
+
+        // --- secondary UV routing (e.g. AttackHeli cockpit emissive on UV2) ---
+        if (floats.TryGetValue("_EmissionUVSec", out var emissionUv) && (int)emissionUv > 0)
+        {
+            SetChannelUv(builder, KnownChannel.Emissive, (int)emissionUv);
+        }
+        if (floats.TryGetValue("_OcclusionUVSet", out var occlusionUv) && (int)occlusionUv > 0)
+        {
+            SetChannelUv(builder, KnownChannel.Occlusion, (int)occlusionUv);
         }
 
         // --- glass (KHR_materials_transmission) ---
@@ -331,6 +351,15 @@ public class RipperMaterialFactory
         }
 
         return builder;
+    }
+
+    private static void SetChannelUv(MaterialBuilder builder, KnownChannel channel, int uvSet)
+    {
+        var texture = builder.GetChannel(channel)?.Texture;
+        if (texture is not null)
+        {
+            texture.CoordinateSet = uvSet;
+        }
     }
 
     private static void NameChannelImage(MaterialBuilder builder, KnownChannel channel, string? name)

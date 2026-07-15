@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rust Ripper",
     "author": "Rust Ripper",
-    "version": (0, 1, 0),
+    "version": (0, 1, 1),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > Rust",
     "description": "Import Rust Ripper GLB exports: correct visibility, paint controls, light tools, daemon search",
@@ -32,13 +32,34 @@ class RustRipperSettings(bpy.types.PropertyGroup):
         name="Hide utility objects",
         description="Hide objects the game never shows (disabled renderers, IO origins, runtime flares)",
         default=True)
+    reuse_meshes: BoolProperty(
+        name="Reuse existing meshes",
+        description="If a mesh with the same Unity identity is already in the file, link it instead of importing a duplicate (e.g. snow and normal pines share one mesh)",
+        default=True)
+    light_power_scale: FloatProperty(
+        name="Light Power",
+        description="Scale factor applied to imported light energy",
+        default=1.0, min=0.0, max=100.0)
 
 
 # ---------------------------------------------------------------- core
 
+def _mesh_key(mesh):
+    pid = mesh.get("unity_path_id")
+    return (str(pid), str(mesh.get("unity_collection"))) if pid is not None else None
+
+
 def _post_process(objects, settings):
     """Apply everything the GLB carries but core glTF cannot express."""
     hidden = 0
+    reused = 0
+    new_meshes = {o.data for o in objects if o.type == "MESH"}
+    registry = {}
+    if settings.reuse_meshes:
+        for mesh in bpy.data.meshes:
+            key = _mesh_key(mesh)
+            if key and mesh not in new_meshes and key not in registry:
+                registry[key] = mesh
     for obj in objects:
         if settings.auto_hide and obj.get("unity_hidden"):
             obj.hide_set(True)
@@ -46,7 +67,29 @@ def _post_process(objects, settings):
             hidden += 1
         if obj.parent is None and obj.type == "EMPTY":
             obj.empty_display_size = settings.root_display_size
-    return hidden
+        if obj.type == "MESH" and settings.reuse_meshes:
+            key = _mesh_key(obj.data)
+            if key and key in registry and registry[key] is not obj.data:
+                duplicate = obj.data
+                obj.data = registry[key]
+                if duplicate.users == 0:
+                    bpy.data.meshes.remove(duplicate)
+                reused += 1
+            elif key:
+                registry[key] = obj.data
+        if obj.type == "LIGHT":
+            info = _light_info(obj)
+            if info:
+                # glTF has no range: use Blender's custom distance cutoff so
+                # small intense lights (gauges) stop flooding the scene
+                rng = info.get("unity_range", 0)
+                if rng and rng > 0:
+                    obj.data.use_custom_distance = True
+                    obj.data.cutoff_distance = rng
+                if hasattr(obj.data, "shadow_soft_size"):
+                    obj.data.shadow_soft_size = max(obj.data.shadow_soft_size, 0.03)
+                obj.data.energy *= settings.light_power_scale
+    return hidden, reused
 
 
 def _build_paint_nodes(glb_path, materials):
@@ -99,9 +142,9 @@ def _import_glb(context, filepath):
     bpy.ops.import_scene.gltf(filepath=filepath)
     new_objects = [o for o in bpy.data.objects if o not in before_objects]
     new_materials = [m for m in bpy.data.materials if m not in before_materials]
-    hidden = _post_process(new_objects, settings)
+    hidden, reused = _post_process(new_objects, settings)
     painted = _build_paint_nodes(filepath, new_materials)
-    return len(new_objects), hidden, painted
+    return len(new_objects), hidden, painted, reused
 
 
 def _light_info(obj):
@@ -133,8 +176,8 @@ class RUST_OT_import_glb(bpy.types.Operator, ImportHelper):
     filter_glob: StringProperty(default="*.glb", options={"HIDDEN"})
 
     def execute(self, context):
-        count, hidden, painted = _import_glb(context, self.filepath)
-        self.report({"INFO"}, f"{count} objects ({hidden} hidden, {painted} paint materials)")
+        count, hidden, painted, reused = _import_glb(context, self.filepath)
+        self.report({"INFO"}, f"{count} objects ({hidden} hidden, {painted} paint, {reused} meshes reused)")
         return {"FINISHED"}
 
 
@@ -161,8 +204,8 @@ class RUST_OT_daemon_import(bpy.types.Operator):
         if not result.get("success"):
             self.report({"ERROR"}, result.get("message", "export failed"))
             return {"CANCELLED"}
-        count, hidden, painted = _import_glb(context, result["path"])
-        self.report({"INFO"}, f"{query}: {count} objects in {result.get('seconds', 0):.1f}s export")
+        count, hidden, painted, reused = _import_glb(context, result["path"])
+        self.report({"INFO"}, f"{query}: {count} objects in {result.get('seconds', 0):.1f}s export ({reused} meshes reused)")
         return {"FINISHED"}
 
 
@@ -211,6 +254,8 @@ class RUST_PT_main(bpy.types.Panel):
         layout.operator("rust.import_glb", icon="FILE_3D")
         layout.prop(settings, "root_display_size")
         layout.prop(settings, "auto_hide")
+        layout.prop(settings, "reuse_meshes")
+        layout.prop(settings, "light_power_scale")
 
 
 class RUST_PT_lights(bpy.types.Panel):
