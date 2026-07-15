@@ -32,6 +32,10 @@ public class RipperMaterialFactory
     /// ships intact and palette attributes let consumers pick the colour.</summary>
     public HashSet<long> RuntimeTintMaterials { get; } = new();
 
+    /// <summary>The runtime-tinted material assets themselves, for sidecar
+    /// delivery of their layer textures (blend masks, tint maps...).</summary>
+    public List<IMaterial> RuntimeTintMaterialAssets { get; } = new();
+
     /// <summary>Paint-node mode: mask textures per painted material, for sidecar export.</summary>
     public Dictionary<long, (string MaterialName, ITexture2D Mask)> DetailMasks { get; } = new();
 
@@ -160,7 +164,10 @@ public class RipperMaterialFactory
             // detail ALBEDO present: the layer composites per-pixel (its own
             // texture set, mask, tiling) and the colour arrives at runtime -
             // never flattened here, all layer data rides in extras
-            RuntimeTintMaterials.Add(material.PathID);
+            if (RuntimeTintMaterials.Add(material.PathID))
+            {
+                RuntimeTintMaterialAssets.Add(material);
+            }
         }
         var baseColorSet = false;
         if (fuzzTexture is not null && diffuseTexture is not null)
@@ -201,7 +208,7 @@ public class RipperMaterialFactory
                 if (tintedImage is not null)
                 {
                     builder.WithBaseColor(tintedImage.Value, baseColor);
-                    NameChannelImage(builder, KnownChannel.BaseColor, diffuseTexture.Name.String + "_painted");
+                    NameChannelImage(builder, KnownChannel.BaseColor, diffuseTexture.Name.String + "_detailtint");
                     DetailPaint[material.PathID] = dc;
                     baseColorSet = true;
                 }

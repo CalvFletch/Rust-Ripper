@@ -90,6 +90,7 @@ public class RipperGlbBuilder
     public IReadOnlySet<long> VertexColorTintMaterials => vertexColorTintMaterials;
     public IReadOnlyDictionary<long, System.Numerics.Vector4> DetailPaint => materials.DetailPaint;
     public IReadOnlySet<long> RuntimeTintMaterials => materials.RuntimeTintMaterials;
+    public IReadOnlyList<AssetRipper.SourceGenerated.Classes.ClassID_21.IMaterial> RuntimeTintMaterialAssets => materials.RuntimeTintMaterialAssets;
     public IReadOnlyDictionary<long, (string MaterialName, AssetRipper.SourceGenerated.Classes.ClassID_28.ITexture2D Mask)> DetailMasks => materials.DetailMasks;
 
     public static SceneBuilder Build(IGameObject root, RipperGlbOptions options)
@@ -143,7 +144,8 @@ public class RipperGlbBuilder
                         MathF.Pow(c.X, 2.2f), MathF.Pow(c.Y, 2.2f), MathF.Pow(c.Z, 2.2f), c.W);
                     var flat = new System.Numerics.Vector4[vertexCount];
                     Array.Fill(flat, linear);
-                    primitive.WithVertexAccessor($"_RUST_PAINT_{i + 1:00}", flat);
+                    // named after the game's own field: customColour is the 1-based palette index
+                    primitive.WithVertexAccessor($"_RUST_CUSTOMCOLOUR_{i + 1:00}", flat);
                 }
             }
         }
@@ -180,7 +182,7 @@ public class RipperGlbBuilder
                     MathF.Pow(paint.X, 2.2f), MathF.Pow(paint.Y, 2.2f), MathF.Pow(paint.Z, 2.2f), paint.W);
                 var flat = new System.Numerics.Vector4[vertexCount];
                 Array.Fill(flat, linear);
-                primitive.WithVertexAccessor("_RUST_PAINT", flat);
+                primitive.WithVertexAccessor("_RUST_DETAILCOLOR", flat);
             }
         }
     }

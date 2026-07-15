@@ -93,14 +93,14 @@ def _post_process(objects, settings):
 
 
 def _build_paint_nodes(glb_path, materials):
-    """Paint-nodes exports ship the albedo raw plus mask sidecars: build
-    mask -> Mix.Factor, albedo -> A, _RUST_PAINT colour attribute -> B."""
+    """Layer-nodes exports ship the albedo raw plus mask sidecars: build
+    mask -> Mix.Factor, albedo -> A, _RUST_DETAILCOLOR attribute -> B."""
     base = os.path.splitext(glb_path)[0]
     built = 0
     for mat in materials:
         if not mat or not mat.use_nodes:
             continue
-        mask_path = f"{base}.paintmask.{mat.name}.png"
+        mask_path = f"{base}.detailmask.{mat.name}.png"
         if not os.path.exists(mask_path):
             continue
         tree = mat.node_tree
@@ -117,8 +117,8 @@ def _build_paint_nodes(glb_path, materials):
         mask_node.location = (-600, 500)
 
         attr = tree.nodes.new("ShaderNodeVertexColor")
-        attr.layer_name = "_RUST_PAINT"
-        attr.label = "Paint Colour"
+        attr.layer_name = "_RUST_DETAILCOLOR"
+        attr.label = "Detail Colour"
         attr.location = (-600, 250)
 
         mix = tree.nodes.new("ShaderNodeMix")

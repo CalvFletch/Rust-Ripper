@@ -733,18 +733,39 @@ internal sealed class Session
                 ok = false;
             }
         }
-        // paint-node sidecars: the detail masks as PNGs next to the GLB
+        // detail-mask sidecars in layer-nodes mode
         if (ok && options.PaintNodes)
         {
             foreach (var (_, (materialName, mask)) in builder.DetailMasks)
             {
                 if (RipperMaterialFactory.TryDecodePng(mask, out var png))
                 {
-                    var maskPath = System.IO.Path.Combine(outDir, $"{resolved.Value.Name}.paintmask.{materialName}.png");
+                    var maskPath = System.IO.Path.Combine(outDir, $"{resolved.Value.Name}.detailmask.{materialName}.png");
                     File.WriteAllBytes(maskPath, png);
-                    Console.WriteLine($"paint mask: {maskPath}");
+                    Console.WriteLine($"detail mask: {maskPath}");
                 }
             }
+        }
+        // runtime-tinted materials: every set texture slot ships as a sidecar -
+        // the layer cannot be composited without its masks and tint maps
+        if (ok && builder.RuntimeTintMaterialAssets.Count > 0)
+        {
+            var written = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var material in builder.RuntimeTintMaterialAssets)
+            {
+                foreach (var (_, texEnv) in material.GetTextureProperties())
+                {
+                    if (texEnv.Texture.TryGetAsset(material.Collection) is not AssetRipper.SourceGenerated.Classes.ClassID_28.ITexture2D texture
+                        || !written.Add(texture.Name.String)
+                        || !RipperMaterialFactory.TryDecodePng(texture, out var png))
+                    {
+                        continue;
+                    }
+                    var texPath = System.IO.Path.Combine(outDir, $"{resolved.Value.Name}.{texture.Name.String}.png");
+                    File.WriteAllBytes(texPath, png);
+                }
+            }
+            Console.WriteLine($"layer textures: {written.Count} sidecars");
         }
         sw.Stop();
         return ok && File.Exists(outPath)

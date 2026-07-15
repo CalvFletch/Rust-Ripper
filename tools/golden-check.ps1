@@ -61,16 +61,19 @@ Assert "wolf: KHR specular on body"          (($g.materials | Where-Object { $_.
 Assert "wolf: _RUST_COLOR demotion"          (($g.meshes.primitives.attributes | Where-Object { $_._RUST_COLOR -ne $null }))
 
 # --- container wall: runtime tint -> palette attributes from ColourLookup ---
-$g = Get-GlbJson (Export-Asset "wall.container.full")
+$wallPath = Export-Asset "wall.container.full"
+$g = Get-GlbJson $wallPath
 $attrs = $g.meshes.primitives.attributes
-Assert "wall: _RUST_PAINT_01 attribute"      (($attrs | Where-Object { $_._RUST_PAINT_01 -ne $null }))
-Assert "wall: _RUST_PAINT_16 attribute"      (($attrs | Where-Object { $_._RUST_PAINT_16 -ne $null }))
-Assert "wall: no invented bake (raw albedo)" (-not ($g.images | Where-Object { $_.name -like "*_painted" }))
+Assert "wall: _RUST_CUSTOMCOLOUR_01 attribute" (($attrs | Where-Object { $_._RUST_CUSTOMCOLOUR_01 -ne $null }))
+Assert "wall: _RUST_CUSTOMCOLOUR_16 attribute" (($attrs | Where-Object { $_._RUST_CUSTOMCOLOUR_16 -ne $null }))
+Assert "wall: no invented bake (raw albedo)"   (-not ($g.images | Where-Object { $_.name -like "*_detailtint" }))
+Assert "wall: blend mask sidecar"              (Test-Path (Join-Path (Split-Path $wallPath) "wall.container.full.shipping_container_mask.png"))
+Assert "wall: tint map sidecar"                (Test-Path (Join-Path (Split-Path $wallPath) "wall.container.full.shipping_container_color_lookup.png"))
 
 # --- barrel: detail paint baked + paint attribute ---
 $g = Get-GlbJson (Export-Asset "loot-barrel-1")
-Assert "barrel: painted albedo image"        (($g.images | Where-Object { $_.name -like "*_painted" }))
-Assert "barrel: _RUST_PAINT attribute"       (($g.meshes.primitives.attributes | Where-Object { $_._RUST_PAINT -ne $null }))
+Assert "barrel: detail tint baked image"     (($g.images | Where-Object { $_.name -like "*_detailtint" }))
+Assert "barrel: _RUST_DETAILCOLOR attribute" (($g.meshes.primitives.attributes | Where-Object { $_._RUST_DETAILCOLOR -ne $null }))
 
 Write-Host ""
 if ($script:fail -eq 0) { Write-Host "GOLDEN SET: all checks passed" -ForegroundColor Green }
