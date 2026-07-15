@@ -26,6 +26,12 @@ public class RipperMaterialFactory
     /// <summary>Materials whose detail-layer paint was baked: PathID -> _DetailColor (as authored, sRGB).</summary>
     public Dictionary<long, System.Numerics.Vector4> DetailPaint { get; } = new();
 
+    /// <summary>Materials whose detail layer is tinted at RUNTIME: detail layer
+    /// on with a detail albedo map, authored colour neutral (the game supplies
+    /// the colour, e.g. from a palette lookup). Never baked - the layer data
+    /// ships intact and palette attributes let consumers pick the colour.</summary>
+    public HashSet<long> RuntimeTintMaterials { get; } = new();
+
     /// <summary>Paint-node mode: mask textures per painted material, for sidecar export.</summary>
     public Dictionary<long, (string MaterialName, ITexture2D Mask)> DetailMasks { get; } = new();
 
@@ -142,11 +148,20 @@ public class RipperMaterialFactory
         var fuzzTexture = profile.FuzzMaskSlot is { } fuzzSlot ? GetTexture(material, fuzzSlot) : null;
         var diffuseTexture = GetTexture(material, profile.BaseColorSlots);
         var detailMask = profile.SupportsDetailPaint ? GetTexture(material, "_DetailMask") : null;
-        var detailTintActive = profile.SupportsDetailPaint
-            && floats.TryGetValue("_DetailLayer", out var detailLayer) && detailLayer != 0f
+        var detailAlbedo = profile.SupportsDetailPaint ? GetTexture(material, "_DetailAlbedoMap") : null;
+        var detailLayerOn = profile.SupportsDetailPaint
+            && floats.TryGetValue("_DetailLayer", out var detailLayer) && detailLayer != 0f;
+        var detailTintActive = detailLayerOn
             && detailMask is not null
-            && GetTexture(material, "_DetailAlbedoMap") is null
+            && detailAlbedo is null
             && colors.TryGetValue("_DetailColor", out var detailColor);
+        if (detailLayerOn && detailAlbedo is not null)
+        {
+            // detail ALBEDO present: the layer composites per-pixel (its own
+            // texture set, mask, tiling) and the colour arrives at runtime -
+            // never flattened here, all layer data rides in extras
+            RuntimeTintMaterials.Add(material.PathID);
+        }
         var baseColorSet = false;
         if (fuzzTexture is not null && diffuseTexture is not null)
         {

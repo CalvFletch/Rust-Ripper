@@ -723,6 +723,7 @@ internal sealed class Session
                     RipperGlbBuilder.DemoteMaskVertexColors(model, builder.VertexColorTintMaterials);
                 }
                 RipperGlbBuilder.AddPaintAttributes(model, builder.DetailPaint);
+                RipperGlbBuilder.AddPaletteAttributes(model, builder.RuntimeTintMaterials, ReadPalette(resolved.Value.Root));
                 model.WriteGLB(fileStream);
                 ok = true;
             }
@@ -940,6 +941,100 @@ internal sealed class Session
         }
         Walk(resolved.Value.Root.GetTransform(), 0);
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Palette colours for a prefab whose hierarchy declares a palette source
+    /// (ComponentSemantics.PaletteSources): follow the component's lookup
+    /// reference to the ColourLookup asset and read its colour array. Colours
+    /// exactly as the game serializes them.
+    /// </summary>
+    private List<System.Numerics.Vector4> ReadPalette(IGameObject root)
+    {
+        // palette source in the exported prefab itself
+        foreach (var monoBehaviour in root.FetchHierarchy().OfType<IMonoBehaviour>())
+        {
+            if (TryResolveLookup(monoBehaviour, out var lookup, out var coloursField)
+                && coloursField is not null
+                && ReadLookupColours(lookup!, coloursField.Value) is { Count: > 0 } palette)
+            {
+                Console.WriteLine($"palette: {palette.Count} colours ({lookup!.Name.String})");
+                return palette;
+            }
+        }
+        // model prefabs referenced by a skin shell carry the tinted materials
+        // but not the palette component - if all loaded palette sources agree
+        // on one lookup asset, use it; ambiguity means no attributes
+        var lookups = new Dictionary<long, IMonoBehaviour>();
+        foreach (var monoBehaviour in GameData.GameBundle.FetchAssets().OfType<IMonoBehaviour>())
+        {
+            if (TryResolveLookup(monoBehaviour, out var lookup, out _))
+            {
+                lookups[lookup!.PathID] = lookup;
+            }
+        }
+        if (lookups.Count == 1)
+        {
+            var lookup = lookups.Values.First();
+            TryResolveColoursField(lookup, out var coloursField);
+            if (coloursField is not null && ReadLookupColours(lookup, coloursField.Value) is { Count: > 0 } palette)
+            {
+                Console.WriteLine($"palette: {palette.Count} colours ({lookup.Name.String}, resolved globally)");
+                return palette;
+            }
+        }
+        else if (lookups.Count > 1)
+        {
+            Console.WriteLine($"palette: ambiguous ({lookups.Count} lookups loaded), no palette attributes");
+        }
+        return [];
+    }
+
+    private static bool TryResolveLookup(IMonoBehaviour monoBehaviour, out IMonoBehaviour? lookup, out SerializableValue? coloursField)
+    {
+        lookup = null;
+        coloursField = null;
+        var className = monoBehaviour.ScriptP?.ClassName_R.String;
+        var schema = RustRipper.Core.ComponentSemantics.PaletteSources.FirstOrDefault(s => s.ClassName == className);
+        if (schema is null || monoBehaviour.LoadStructure() is not { } structure
+            || structure.TryGetField(schema.LookupField) is not { CValue: AssetRipper.Assets.Metadata.IPPtr pptr }
+            || monoBehaviour.Collection.TryGetAsset(pptr.FileID, pptr.PathID) is not IMonoBehaviour resolved)
+        {
+            return false;
+        }
+        lookup = resolved;
+        TryResolveColoursField(resolved, out coloursField);
+        return true;
+    }
+
+    private static void TryResolveColoursField(IMonoBehaviour lookup, out SerializableValue? coloursField)
+    {
+        coloursField = null;
+        var lookupClass = lookup.ScriptP?.ClassName_R.String;
+        foreach (var schema in RustRipper.Core.ComponentSemantics.PaletteSources)
+        {
+            if (lookup.LoadStructure() is { } structure && structure.TryGetField(schema.ColoursField) is { } field)
+            {
+                coloursField = field;
+                return;
+            }
+        }
+    }
+
+    private static List<System.Numerics.Vector4> ReadLookupColours(IMonoBehaviour lookup, SerializableValue coloursField)
+    {
+        var palette = new List<System.Numerics.Vector4>();
+        foreach (var element in coloursField.AsAssetArray)
+        {
+            if (element is SerializableStructure colour
+                && colour.TryGetField("r") is { } r && colour.TryGetField("g") is { } g
+                && colour.TryGetField("b") is { } b)
+            {
+                var a = colour.TryGetField("a")?.AsSingle ?? 1f;
+                palette.Add(new System.Numerics.Vector4(r.AsSingle, g.AsSingle, b.AsSingle, a));
+            }
+        }
+        return palette;
     }
 
     /// <summary>Decode any loaded texture by asset name to a PNG on disk

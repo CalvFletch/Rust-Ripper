@@ -35,4 +35,16 @@ public static class ComponentSemantics
     [
         new("moduleSockets", "socketTransform"),
     ];
+
+    /// <summary>Components that select a runtime paint colour from a palette
+    /// ScriptableObject (colour index chosen per-instance by the game).
+    /// The palette's colours are exported as one vertex-colour attribute per
+    /// entry (_RUST_PAINT_01..) on runtime-tinted primitives.</summary>
+    public sealed record PaletteSourceSchema(string ClassName, string LookupField, string ColoursField);
+
+    public static readonly PaletteSourceSchema[] PaletteSources =
+    [
+        // ConstructionSkin_CustomDetail : ConstructionSkin { ConstructionSkin_ColourLookup ColourLookup }
+        new("ConstructionSkin_CustomDetail", "ColourLookup", "AllColours"),
+    ];
 }

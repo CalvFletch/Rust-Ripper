@@ -89,6 +89,7 @@ public class RipperGlbBuilder
 
     public IReadOnlySet<long> VertexColorTintMaterials => vertexColorTintMaterials;
     public IReadOnlyDictionary<long, System.Numerics.Vector4> DetailPaint => materials.DetailPaint;
+    public IReadOnlySet<long> RuntimeTintMaterials => materials.RuntimeTintMaterials;
     public IReadOnlyDictionary<long, (string MaterialName, AssetRipper.SourceGenerated.Classes.ClassID_28.ITexture2D Mask)> DetailMasks => materials.DetailMasks;
 
     public static SceneBuilder Build(IGameObject root, RipperGlbOptions options)
@@ -105,6 +106,47 @@ public class RipperGlbBuilder
         var sceneBuilder = new SceneBuilder();
         builder.AddGameObject(sceneBuilder, null, root.GetTransform());
         return sceneBuilder;
+    }
+
+    /// <summary>
+    /// Palette attributes for runtime-tinted primitives: one flat vertex-colour
+    /// attribute per palette entry (_RUST_PAINT_01..), colours straight from
+    /// the game's ColourLookup asset (sRGB authored -> linear attributes).
+    /// Consumers select the paint by selecting the attribute; the game's own
+    /// index (customColour, 1-based) matches the attribute number.
+    /// </summary>
+    public static void AddPaletteAttributes(SharpGLTF.Schema2.ModelRoot model,
+        IReadOnlySet<long> runtimeTintMaterials, IReadOnlyList<System.Numerics.Vector4> palette)
+    {
+        if (palette.Count == 0 || runtimeTintMaterials.Count == 0)
+        {
+            return;
+        }
+        foreach (var mesh in model.LogicalMeshes)
+        {
+            foreach (var primitive in mesh.Primitives)
+            {
+                var pathId = (primitive.Material?.Extras as JsonObject)?["unity_path_id"]?.GetValue<long>();
+                if (pathId is not { } id || !runtimeTintMaterials.Contains(id))
+                {
+                    continue;
+                }
+                var vertexCount = primitive.GetVertexAccessor("POSITION")?.Count ?? 0;
+                if (vertexCount <= 0)
+                {
+                    continue;
+                }
+                for (var i = 0; i < palette.Count; i++)
+                {
+                    var c = palette[i];
+                    var linear = new System.Numerics.Vector4(
+                        MathF.Pow(c.X, 2.2f), MathF.Pow(c.Y, 2.2f), MathF.Pow(c.Z, 2.2f), c.W);
+                    var flat = new System.Numerics.Vector4[vertexCount];
+                    Array.Fill(flat, linear);
+                    primitive.WithVertexAccessor($"_RUST_PAINT_{i + 1:00}", flat);
+                }
+            }
+        }
     }
 
     /// <summary>

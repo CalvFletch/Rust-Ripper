@@ -60,6 +60,13 @@ Assert "wolf: animal-fur profile applied"    ($fur -and $fur.extras.rust_profile
 Assert "wolf: KHR specular on body"          (($g.materials | Where-Object { $_.name -eq "Wolf" }).extensions.KHR_materials_specular)
 Assert "wolf: _RUST_COLOR demotion"          (($g.meshes.primitives.attributes | Where-Object { $_._RUST_COLOR -ne $null }))
 
+# --- container wall: runtime tint -> palette attributes from ColourLookup ---
+$g = Get-GlbJson (Export-Asset "wall.container.full")
+$attrs = $g.meshes.primitives.attributes
+Assert "wall: _RUST_PAINT_01 attribute"      (($attrs | Where-Object { $_._RUST_PAINT_01 -ne $null }))
+Assert "wall: _RUST_PAINT_16 attribute"      (($attrs | Where-Object { $_._RUST_PAINT_16 -ne $null }))
+Assert "wall: no invented bake (raw albedo)" (-not ($g.images | Where-Object { $_.name -like "*_painted" }))
+
 # --- barrel: detail paint baked + paint attribute ---
 $g = Get-GlbJson (Export-Asset "loot-barrel-1")
 Assert "barrel: painted albedo image"        (($g.images | Where-Object { $_.name -like "*_painted" }))
