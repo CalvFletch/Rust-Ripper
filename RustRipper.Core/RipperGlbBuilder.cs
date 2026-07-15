@@ -96,6 +96,7 @@ public class RipperGlbBuilder
     {
         builder = new RipperGlbBuilder(options);
         builder.BuildLodMembership(root);
+        builder.BuildNameConventionLodMembership(root);
         builder.BuildKeepSet(root);
         var sceneBuilder = new SceneBuilder();
         builder.AddGameObject(sceneBuilder, null, root.GetTransform());
@@ -227,6 +228,46 @@ public class RipperGlbBuilder
                     }
                     break;
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Narrow, user-approved exception for vehicle modules: their body LOD
+    /// meshes are claimed by NO component (verified exhaustively - the client
+    /// switches them by child-name convention in code stripped from the data).
+    /// The gate: sibling GameObjects under one parent whose names match
+    /// exactly "LOD&lt;n&gt;&lt;same suffix&gt;", at least two levels including 0,
+    /// and only renderers no LOD component has already claimed.
+    /// </summary>
+    private void BuildNameConventionLodMembership(IGameObject root)
+    {
+        var pattern = new System.Text.RegularExpressions.Regex(@"^LOD(\d+)(.*)$");
+        var groups = new Dictionary<string, List<(int Level, IRenderer Renderer)>>();
+        foreach (var gameObject in root.FetchHierarchy().OfType<IGameObject>())
+        {
+            var match = pattern.Match(gameObject.Name.String);
+            if (!match.Success || !gameObject.TryGetComponent(out IRenderer? renderer))
+            {
+                continue;
+            }
+            var suffix = match.Groups[2].Value;
+            if (!groups.TryGetValue(suffix, out var list))
+            {
+                groups[suffix] = list = new List<(int, IRenderer)>();
+            }
+            list.Add((int.Parse(match.Groups[1].Value), renderer));
+        }
+        foreach (var (_, set) in groups)
+        {
+            if (set.Count < 2 || !set.Any(e => e.Level == 0)
+                || set.Any(e => lodMembership.ContainsKey(e.Renderer)))
+            {
+                continue;
+            }
+            foreach (var (level, renderer) in set)
+            {
+                lodMembership.TryAdd(renderer, (level, false));
             }
         }
     }
