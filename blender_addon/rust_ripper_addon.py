@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rust Ripper",
     "author": "Rust Ripper",
-    "version": (0, 1, 3),
+    "version": (0, 1, 4),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > Rust",
     "description": "Import Rust Ripper GLB exports: correct visibility, paint controls, light tools, daemon search",
@@ -163,6 +163,7 @@ def _material_color_attributes(mat, objects):
 
 
 _BLEND_LAYER_GROUP = "Rust/Standard Blend Layer"
+_GROUP_VERSION = 2
 
 
 def _blend_layer_group():
@@ -172,24 +173,34 @@ def _blend_layer_group():
     inside is the exact curve read from the game's compiled fragment
     programs (docs/OUTPUT_CONTRACT.md):
 
-        blend = min(1, (weight * mask.G * (_DetailBlendFactor + 1)) ** _DetailBlendFalloff)
+        blend = min(1, (vertexWeight * tintAlpha * mask.G * (_DetailBlendFactor + 1)) ** _DetailBlendFalloff)
         color = lerp(base, detailAlbedo * tint, blend)
+
+    Versioned: an older group in the file gets missing sockets added and
+    its internals rebuilt in place, so existing materials keep working.
     """
     group = bpy.data.node_groups.get(_BLEND_LAYER_GROUP)
-    if group is not None:
+    if group is not None and group.get("rust_ripper_version", 0) >= _GROUP_VERSION:
         return group
-    group = bpy.data.node_groups.new(_BLEND_LAYER_GROUP, "ShaderNodeTree")
-    group["rust_ripper_version"] = 1
+    if group is None:
+        group = bpy.data.node_groups.new(_BLEND_LAYER_GROUP, "ShaderNodeTree")
+    group["rust_ripper_version"] = _GROUP_VERSION
+    group.use_fake_user = True
+
+    present = {(item.name, item.in_out) for item in group.interface.items_tree
+               if getattr(item, "in_out", None)}
 
     def socket(name, in_out, socket_type, default=None):
+        if (name, in_out) in present:
+            return
         item = group.interface.new_socket(name=name, in_out=in_out, socket_type=socket_type)
         if default is not None:
             item.default_value = default
-        return item
 
     socket("Base Color", "INPUT", "NodeSocketColor", (0.8, 0.8, 0.8, 1.0))
     socket("Detail Albedo", "INPUT", "NodeSocketColor", (1.0, 1.0, 1.0, 1.0))
     socket("Tint", "INPUT", "NodeSocketColor", (1.0, 1.0, 1.0, 1.0))
+    socket("Tint Alpha", "INPUT", "NodeSocketFloat", 1.0)
     socket("Mask", "INPUT", "NodeSocketColor", (1.0, 1.0, 1.0, 1.0))
     socket("Vertex Weight", "INPUT", "NodeSocketFloat", 1.0)
     # shader defaults; each material instance sets its authored values
@@ -200,6 +211,7 @@ def _blend_layer_group():
     socket("Blend Factor", "OUTPUT", "NodeSocketFloat")
 
     nodes, links = group.nodes, group.links
+    nodes.clear()
     group_in = nodes.new("NodeGroupInput")
     group_out = nodes.new("NodeGroupOutput")
 
@@ -230,10 +242,14 @@ def _blend_layer_group():
     links.new(pick.outputs[0], weighted.inputs[0])
     links.new(group_in.outputs["Vertex Weight"], weighted.inputs[1])
 
+    tint_alpha = math("MULTIPLY", "x tint alpha (weight = vcol.a x tint.a)")
+    links.new(weighted.outputs[0], tint_alpha.inputs[0])
+    links.new(group_in.outputs["Tint Alpha"], tint_alpha.inputs[1])
+
     gain = math("ADD", "_DetailBlendFactor + 1", second=1.0)
     links.new(group_in.outputs["_DetailBlendFactor"], gain.inputs[0])
     gained = math("MULTIPLY", "x (_DetailBlendFactor + 1)")
-    links.new(weighted.outputs[0], gained.inputs[0])
+    links.new(tint_alpha.outputs[0], gained.inputs[0])
     links.new(gain.outputs[0], gained.inputs[1])
 
     curved = math("POWER", "^ _DetailBlendFalloff")
@@ -336,20 +352,24 @@ def _build_blend_layer_nodes(glb_path, materials, objects):
             links.new(mapping.outputs["Vector"], detail_node.inputs["Vector"])
         links.new(detail_node.outputs["Color"], layer.inputs["Detail Albedo"])
 
+        # weight = vcol.a x tint.a in the compiled shader: alpha rides along
         if "_RUST_CUSTOMCOLOUR_01" in attrs:
             tint = nodes.new("ShaderNodeVertexColor")
             tint.layer_name = "_RUST_CUSTOMCOLOUR_01"
             tint.label = "customColour 01 (swap layer for other palette entries)"
             links.new(tint.outputs["Color"], layer.inputs["Tint"])
+            links.new(tint.outputs["Alpha"], layer.inputs["Tint Alpha"])
         elif "_RUST_DETAILCOLOR" in attrs:
             tint = nodes.new("ShaderNodeVertexColor")
             tint.layer_name = "_RUST_DETAILCOLOR"
             tint.label = "_DetailColor (authored)"
             links.new(tint.outputs["Color"], layer.inputs["Tint"])
+            links.new(tint.outputs["Alpha"], layer.inputs["Tint Alpha"])
         else:
             colors = mat.get("unity_colors")
             authored = list(colors.get("_DetailColor", [1.0, 1.0, 1.0, 1.0])) if colors is not None else [1.0, 1.0, 1.0, 1.0]
             layer.inputs["Tint"].default_value = (*authored[:3], 1.0)
+            layer.inputs["Tint Alpha"].default_value = authored[3] if len(authored) > 3 else 1.0
 
         base_input = bsdf.inputs["Base Color"]
         if base_input.is_linked:

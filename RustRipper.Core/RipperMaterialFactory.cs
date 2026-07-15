@@ -155,15 +155,20 @@ public class RipperMaterialFactory
         var detailAlbedo = profile.SupportsDetailPaint ? GetTexture(material, "_DetailAlbedoMap") : null;
         var detailLayerOn = profile.SupportsDetailPaint
             && floats.TryGetValue("_DetailLayer", out var detailLayer) && detailLayer != 0f;
+        // the Blend Layer shader family gates its layer on _DetailBlendLayer
+        // (compiled as _DETAILBLENDLAYER_ON) - same mechanism, separate switch
+        var blendLayerOn = profile.SupportsDetailPaint
+            && floats.TryGetValue("_DetailBlendLayer", out var blendLayer) && blendLayer != 0f;
         var detailTintActive = detailLayerOn
             && detailMask is not null
             && detailAlbedo is null
             && colors.TryGetValue("_DetailColor", out var detailColor);
-        if (detailLayerOn && detailAlbedo is not null)
+        if ((detailLayerOn || blendLayerOn) && detailAlbedo is not null)
         {
             // detail ALBEDO present: the layer composites per-pixel (its own
-            // texture set, mask, tiling) and the colour arrives at runtime -
-            // never flattened here, all layer data rides in extras
+            // texture set, mask, tiling; colour authored or runtime-supplied) -
+            // never flattened here, all layer data rides in extras and the
+            // layer textures ship as sidecars
             if (RuntimeTintMaterials.Add(material.PathID))
             {
                 RuntimeTintMaterialAssets.Add(material);

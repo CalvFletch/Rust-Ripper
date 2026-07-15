@@ -381,6 +381,9 @@ internal static class Cli
                         var hierReport = session.HierarchyReport(q);
                         WriteJson(context, hierReport != null ? 200 : 404, new { report = hierReport });
                         break;
+                    case "/matusers":
+                        WriteJson(context, 200, session.MatUsers(q));
+                        break;
                     case "/shaderdump":
                         var shaderOut = request.QueryString["out"] ?? "export";
                         var shaderReport = session.ShaderDump(q, shaderOut,
@@ -1082,6 +1085,114 @@ internal sealed class Session
         var path = System.IO.Path.GetFullPath(System.IO.Path.Combine(outDir, $"{texture.Name.String}.png"));
         File.WriteAllBytes(path, png);
         return path;
+    }
+
+    /// <summary>
+    /// Material survey by shader: every loaded material whose parsed shader
+    /// name matches, its detail-layer slots, whether base and detail albedo
+    /// are the same texture asset (PPtr identity - works even when texture
+    /// bundles are not loaded), and which loaded prefab roots render it.
+    /// Plus an aggregate over ALL loaded materials that set a detail albedo.
+    /// Scope: currently loaded bundles.
+    /// </summary>
+    public object MatUsers(string shaderQuery)
+    {
+        (int FileID, long PathID)? Slot(IMaterial material, string slot)
+        {
+            if (material.TryGetTextureProperty(slot, out var texEnv) && texEnv.Texture.PathID != 0)
+            {
+                return (texEnv.Texture.FileID, texEnv.Texture.PathID);
+            }
+            return null;
+        }
+        string TexName(IMaterial material, string slot)
+        {
+            if (!material.TryGetTextureProperty(slot, out var texEnv) || texEnv.Texture.PathID == 0)
+            {
+                return "";
+            }
+            return texEnv.Texture.TryGetAsset(material.Collection) is AssetRipper.SourceGenerated.Classes.ClassID_28.ITexture2D texture
+                ? texture.Name.String
+                : $"(unloaded FileID {texEnv.Texture.FileID} PathID {texEnv.Texture.PathID})";
+        }
+        float? F(IMaterial material, string name)
+            => RipperMaterialFactory.TryGetFloat(material, name, out var v) ? v : null;
+
+        var allMaterials = GameData.GameBundle.FetchAssets().OfType<IMaterial>().ToList();
+        var matched = allMaterials
+            .Where(m => (m.Shader_C21P?.ParsedForm.Name_R.String ?? "").Contains(shaderQuery, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        var users = matched.ToDictionary(m => m, _ => new SortedSet<string>(StringComparer.OrdinalIgnoreCase));
+        foreach (var renderer in GameData.GameBundle.FetchAssets().OfType<IRenderer>())
+        {
+            foreach (var pptr in renderer.Materials_C25)
+            {
+                if (pptr.TryGetAsset(renderer.Collection, out IMaterial? used) && used != null
+                    && users.TryGetValue(used, out var roots))
+                {
+                    roots.Add(renderer.GameObject_C25P?.GetRoot().Name.String ?? "?");
+                }
+            }
+        }
+
+        var materials = matched.Select(m => new
+        {
+            material = m.Name.String,
+            collection = m.Collection.Name,
+            shader = m.Shader_C21P?.ParsedForm.Name_R.String ?? "",
+            mainTex = TexName(m, "_MainTex"),
+            detailAlbedo = TexName(m, "_DetailAlbedoMap"),
+            sameAlbedoTexture = Slot(m, "_DetailAlbedoMap") is { } d && d.Equals(Slot(m, "_MainTex")),
+            blendMask = TexName(m, "_DetailBlendMaskMap"),
+            tintMap = TexName(m, "_DetailTintMap"),
+            detailBlendLayer = F(m, "_DetailBlendLayer"),
+            detailBlendFactor = F(m, "_DetailBlendFactor"),
+            detailBlendFalloff = F(m, "_DetailBlendFalloff"),
+            usedBy = users[m].Take(12).ToList(),
+            userCount = users[m].Count,
+        }).OrderBy(x => x.material).ToList();
+
+        int sameCount = 0, differentCount = 0;
+        var differentExamples = new List<object>();
+        foreach (var m in allMaterials)
+        {
+            if (Slot(m, "_DetailAlbedoMap") is not { } detail)
+            {
+                continue;
+            }
+            if (detail.Equals(Slot(m, "_MainTex")))
+            {
+                sameCount++;
+            }
+            else
+            {
+                differentCount++;
+                if (differentExamples.Count < 15)
+                {
+                    differentExamples.Add(new
+                    {
+                        material = m.Name.String,
+                        shader = m.Shader_C21P?.ParsedForm.Name_R.String ?? "",
+                        mainTex = TexName(m, "_MainTex"),
+                        detailAlbedo = TexName(m, "_DetailAlbedoMap"),
+                    });
+                }
+            }
+        }
+        return new
+        {
+            query = shaderQuery,
+            matchedMaterials = matched.Count,
+            materials,
+            detailAlbedoAggregate = new
+            {
+                withDetailAlbedo = sameCount + differentCount,
+                sameAsMainTex = sameCount,
+                differentFromMainTex = differentCount,
+                differentExamples,
+            },
+        };
     }
 
     /// <summary>
