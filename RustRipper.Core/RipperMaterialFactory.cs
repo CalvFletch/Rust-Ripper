@@ -89,17 +89,35 @@ public class RipperMaterialFactory
             ["unity_textures"] = texturesJson,
         };
 
-        // Additive shaders (particle glows like animal night-eyes) are not lit
-        // surfaces: closest glTF equivalent is black base + emissive + blend.
-        if (shaderName.Contains("Additive", StringComparison.OrdinalIgnoreCase))
+        // Glow overlays (flares, particle glows, halos) — detected from render
+        // STATE, never names: ZWrite off plus an additive blend (DstBlend=One,
+        // e.g. Particles/Additive SrcAlpha+One) or premultiplied blend
+        // (One+OneMinusSrcAlpha) on a shader that declares soft-particle
+        // fading (_InvFade) — plain transparent/glass lacks _InvFade.
+        // glTF has no additive blend: black base whose alpha is the texture's
+        // brightness + emissive = bright parts glow, black parts vanish.
+        var blend = GetBlendState(material, floats);
+        var isGlowOverlay = blend is { } blendState && blendState.ZWrite == 0f
+            && (blendState.Dst == 1f || (blendState.Src == 1f && blendState.Dst == 10f && floats.ContainsKey("_InvFade")));
+        if (isGlowOverlay)
         {
-            builder.WithBaseColor(new System.Numerics.Vector4(0, 0, 0, 0.35f));
             builder.WithMetallicRoughness(0f, 1f);
             builder.WithAlpha(AlphaMode.BLEND);
-            if (TryGetImage(material, "raw", out var glowImage, out var glowName, "_MainTex"))
+            var glowStrength = floats.TryGetValue("_ColorMultiplier", out var cm) && cm > 0f ? cm : 1f;
+            if (TryGetImage(material, "lumalpha", out var glowImage, out var glowName, "_MainTex"))
             {
+                builder.WithBaseColor(glowImage.Value, new System.Numerics.Vector4(0, 0, 0, 1));
+                NameChannelImage(builder, KnownChannel.BaseColor, glowName);
                 builder.WithEmissive(glowImage.Value, new System.Numerics.Vector3(1, 1, 1));
                 NameChannelImage(builder, KnownChannel.Emissive, glowName);
+            }
+            else
+            {
+                builder.WithBaseColor(new System.Numerics.Vector4(0, 0, 0, 0.35f));
+            }
+            if (glowStrength > 1f)
+            {
+                builder.WithChannelParam(KnownChannel.Emissive, KnownProperty.EmissiveStrength, glowStrength);
             }
             return builder;
         }
@@ -392,6 +410,35 @@ public class RipperMaterialFactory
     }
 
     /// <summary>
+    /// Render blend state, purely from data: the material's own _SrcBlend/
+    /// _DstBlend/_ZWrite floats when the shader exposes them, else the shader
+    /// asset's parsed first-pass state (covers Unity builtin shaders).
+    /// Unity BlendMode: 0=Zero 1=One 5=SrcAlpha 10=OneMinusSrcAlpha.
+    /// </summary>
+    private static (float Src, float Dst, float ZWrite)? GetBlendState(IMaterial material, Dictionary<string, float> floats)
+    {
+        if (floats.TryGetValue("_SrcBlend", out var src) && floats.TryGetValue("_DstBlend", out var dst))
+        {
+            return (src, dst, floats.TryGetValue("_ZWrite", out var zw) ? zw : 1f);
+        }
+        try
+        {
+            if (material.Shader_C21P?.ParsedForm is { } parsed
+                && parsed.SubShaders.Count > 0
+                && parsed.SubShaders[0].Passes.Count > 0
+                && parsed.SubShaders[0].Passes[0].State is { } state)
+            {
+                return (state.RtBlend0.SourceBlend.Val, state.RtBlend0.DestinationBlend.Val, state.ZWrite.Val);
+            }
+        }
+        catch
+        {
+            // shader variants without a parsed form
+        }
+        return null;
+    }
+
+    /// <summary>
     /// Colorize is authored on many materials but only active when an enable
     /// flag says so (stock clothing has _ColorizeLayer=1 with Enabled=0 - the
     /// layer exists for runtime skin tinting). When no enable flag is present
@@ -632,6 +679,7 @@ public class RipperMaterialFactory
                         "specgloss" => new Rgba32(0, Roughness(p.A, scale), 0, 255),
                         "albedogloss" => new Rgba32(0, Roughness(p.A, scale), 255, 255),
                         "packedmap" => new Rgba32(p.A, Roughness(p.G, scale), p.B, 255),
+                        "lumalpha" => new Rgba32(p.R, p.G, p.B, (byte)(Math.Max(p.R, Math.Max(p.G, p.B)) * p.A / 255)),
                         _ => p,
                     };
                 }
