@@ -381,6 +381,15 @@ internal static class Cli
                         var hierReport = session.HierarchyReport(q);
                         WriteJson(context, hierReport != null ? 200 : 404, new { report = hierReport });
                         break;
+                    case "/shaderdump":
+                        var shaderOut = request.QueryString["out"] ?? "export";
+                        var shaderReport = session.ShaderDump(q, shaderOut,
+                            request.QueryString["stage"] ?? "fragment",
+                            request.QueryString["kw"] ?? "",
+                            request.QueryString["plat"] ?? "",
+                            int.TryParse(request.QueryString["max"], out var maxDisasm) ? maxDisasm : 4);
+                        WriteJson(context, shaderReport != null ? 200 : 404, shaderReport ?? new { error = $"no shader or material matches '{q}'" });
+                        break;
                     default:
                         WriteJson(context, 404, new { error = "unknown endpoint" });
                         break;
@@ -1073,6 +1082,32 @@ internal sealed class Session
         var path = System.IO.Path.GetFullPath(System.IO.Path.Combine(outDir, $"{texture.Name.String}.png"));
         File.WriteAllBytes(path, png);
         return path;
+    }
+
+    /// <summary>
+    /// Compiled shader program dump: find the Shader asset by its parsed
+    /// name (or through a material that uses it) and hand it to the
+    /// extraction layer. The exact blend math lives only in these programs.
+    /// </summary>
+    public object? ShaderDump(string query, string outDir, string stage, string keywords, string platform, int max)
+    {
+        var shaders = GameData.GameBundle.FetchAssets()
+            .OfType<AssetRipper.SourceGenerated.Classes.ClassID_48.IShader>()
+            .ToList();
+        var shader = shaders.FirstOrDefault(s => s.ParsedForm.Name_R.String.Equals(query, StringComparison.OrdinalIgnoreCase))
+            ?? shaders.FirstOrDefault(s => s.ParsedForm.Name_R.String.Contains(query, StringComparison.OrdinalIgnoreCase));
+        if (shader == null)
+        {
+            shader = GameData.GameBundle.FetchAssets().OfType<IMaterial>()
+                .FirstOrDefault(m => m.Name.String.Equals(query, StringComparison.OrdinalIgnoreCase))
+                ?.Shader_C21P;
+        }
+        if (shader == null)
+        {
+            return null;
+        }
+        var kwFilter = keywords.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return ShaderBlobDump.Dump(shader, outDir, stage, kwFilter, platform, max);
     }
 
     private Dictionary<string, string>? guidToPath;

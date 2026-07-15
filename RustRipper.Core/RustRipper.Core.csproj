@@ -4,6 +4,9 @@
     <ProjectReference Include="..\external\AssetRipper\Source\AssetRipper.Export.PrimaryContent\AssetRipper.Export.PrimaryContent.csproj" />
     <ProjectReference Include="..\external\AssetRipper\Source\AssetRipper.Processing\AssetRipper.Processing.csproj" />
     <ProjectReference Include="..\external\AssetRipper\Source\AssetRipper.Export.UnityProjects\AssetRipper.Export.UnityProjects.csproj" />
+    <!-- shader program extraction: SMOL-V decode + SPIR-V disassembly -->
+    <ProjectReference Include="..\external\AssetRipper\Source\Smolv\Smolv.csproj" />
+    <ProjectReference Include="..\external\AssetRipper\Source\SpirV\SpirV.csproj" />
   </ItemGroup>
 
   <ItemGroup>
