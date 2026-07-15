@@ -67,12 +67,6 @@ def _post_process(objects, settings):
             hidden += 1
         if obj.parent is None and obj.type == "EMPTY":
             obj.empty_display_size = settings.root_display_size
-        if obj.type == "MESH":
-            # stable UV names instead of Blender's UVMap / UVMap.001 defaults
-            for index, uv_layer in enumerate(obj.data.uv_layers):
-                expected = f"UV{index}"
-                if uv_layer.name != expected and not uv_layer.name.startswith("UV"):
-                    uv_layer.name = expected
         if obj.type == "MESH" and settings.reuse_meshes:
             key = _mesh_key(obj.data)
             if key and key in registry and registry[key] is not obj.data:

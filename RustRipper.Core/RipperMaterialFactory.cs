@@ -149,7 +149,8 @@ public class RipperMaterialFactory
             if (furImage is not null)
             {
                 builder.WithBaseColor(furImage.Value, baseColor);
-                NameChannelImage(builder, KnownChannel.BaseColor, diffuseTexture.Name.String);
+                // distinct name: this is diffuse RGB + fuzz-mask alpha, not the body albedo
+                NameChannelImage(builder, KnownChannel.BaseColor, diffuseTexture.Name.String + "_fuzzalpha");
                 builder.WithAlpha(AlphaMode.BLEND);
                 baseColorSet = true;
             }
@@ -175,7 +176,7 @@ public class RipperMaterialFactory
                 if (tintedImage is not null)
                 {
                     builder.WithBaseColor(tintedImage.Value, baseColor);
-                    NameChannelImage(builder, KnownChannel.BaseColor, diffuseTexture.Name.String);
+                    NameChannelImage(builder, KnownChannel.BaseColor, diffuseTexture.Name.String + "_painted");
                     DetailPaint[material.PathID] = dc;
                     baseColorSet = true;
                 }
