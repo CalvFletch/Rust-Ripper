@@ -54,6 +54,11 @@ public record RipperGlbOptions
     /// children — they re-parent to the nearest content node (mesh) or the
     /// root, matching how an artist would clean the hierarchy.</summary>
     public bool CollapseEmptyChains { get; init; } = true;
+
+    /// <summary>Flag placeholder-material geometry (IO wiring origins etc.) as
+    /// unity_hidden so it imports hidden. Off keeps it visible; disabled
+    /// renderers and inactive objects are always flagged.</summary>
+    public bool HideUtility { get; init; } = true;
 }
 
 /// <summary>
@@ -315,13 +320,23 @@ public class RipperGlbBuilder
             return;
         }
 
-        var node = parentNode is null ? new NodeBuilder(gameObject.Name) : parentNode.CreateNode(gameObject.Name);
+        // roots carry the full prefab path in their name; the node gets the
+        // short prefab name, the path rides in extras
+        var nodeName = parentNode is null
+            ? System.IO.Path.GetFileNameWithoutExtension(gameObject.Name.String)
+            : gameObject.Name.String;
+        var node = parentNode is null ? new NodeBuilder(nodeName) : parentNode.CreateNode(nodeName);
         node.Extras = new JsonObject
         {
             ["unity_game_object"] = gameObject.Name.String,
             ["unity_path_id"] = gameObject.PathID,
             ["unity_collection"] = gameObject.Collection.Name,
+            ["unity_layer"] = gameObject.Layer,
         };
+        if (parentNode is null)
+        {
+            node.Extras["unity_prefab_path"] = gameObject.Name.String;
+        }
         // hidden-in-game signals: inactive GameObject (the addon hides these on
         // import). Roots are exempt: Rust stores prefab-scene roots deactivated
         // and activates instances at spawn.
@@ -359,11 +374,15 @@ public class RipperGlbBuilder
 
         if (options.IncludeLights && gameObject.TryGetComponent(out ILight? light))
         {
-            // leaf light nodes take the -Z flip inline instead of a wrapper child
-            var isLeaf = !EmitsGeometry(gameObject)
+            // point lights are directionless: no flip needed, attach in place.
+            // Spots/directionals need the -Z flip — inline only on leaf nodes,
+            // otherwise the flip would rotate the children too.
+            var noGeometry = !EmitsGeometry(gameObject);
+            var isLeaf = noGeometry
                 && !transform.Children_C4P.WhereNotNull().Any(ct =>
                     ct.GameObject_C4P is { } childGo && (!options.PruneEmpties || keep.Contains(childGo)));
-            AddLight(sceneBuilder, node, light, isLeaf);
+            var inline = light.Type == 2 ? noGeometry : isLeaf;
+            AddLight(sceneBuilder, node, light, inline);
         }
 
         foreach (var childTransform in transform.Children_C4P.WhereNotNull())
@@ -413,18 +432,46 @@ public class RipperGlbBuilder
         {
             return;
         }
+
+        // every Unity light property rides along for the addon
+        JsonObject LightExtras() => new()
+        {
+            ["unity_light_type"] = light.Type,
+            ["unity_intensity"] = light.Intensity,
+            ["unity_range"] = light.Range,
+            ["unity_spot_angle"] = light.SpotAngle,
+            ["unity_inner_spot_angle"] = light.InnerSpotAngle,
+            ["unity_color"] = new JsonArray(light.Color.R, light.Color.G, light.Color.B, light.Color.A),
+            ["unity_shadows"] = (int)light.ShadowsE,
+            ["unity_bounce_intensity"] = light.BounceIntensity,
+            ["unity_render_mode"] = light.RenderMode,
+            ["unity_color_temperature"] = light.ColorTemperature,
+            ["unity_use_color_temperature"] = light.UseColorTemperature,
+            ["unity_cookie"] = light.CookieP?.Name.String,
+            ["unity_cookie_size"] = light.CookieSize,
+        };
+        lightBuilder.Extras = LightExtras();
+
         var flip = System.Numerics.Matrix4x4.CreateFromQuaternion(
             System.Numerics.Quaternion.CreateFromAxisAngle(System.Numerics.Vector3.UnitY, MathF.PI));
         if (inlineFlip)
         {
             lightBuilder.Name = node.Name;
-            node.LocalMatrix = flip * node.LocalMatrix;
+            if (light.Type != 2)
+            {
+                node.LocalMatrix = flip * node.LocalMatrix;
+            }
+            if (node.Extras is JsonObject nodeExtras)
+            {
+                nodeExtras["unity_light"] = LightExtras();
+            }
             sceneBuilder.AddLight(lightBuilder, node);
             return;
         }
         lightBuilder.Name = node.Name + "_light";
         var lightNode = node.CreateNode(lightBuilder.Name);
         lightNode.LocalMatrix = flip;
+        lightNode.Extras = new JsonObject { ["unity_light"] = LightExtras() };
         sceneBuilder.AddLight(lightBuilder, lightNode);
     }
 
@@ -478,9 +525,10 @@ public class RipperGlbBuilder
             }
             pairs[i] = (subMeshes[subsetIndices[i]], materials.GetOrMake(material));
         }
-        // hidden-in-game signals: disabled renderer, or nothing but Unity's
-        // placeholder material (utility geometry like IO wiring origins)
-        if ((!renderer.Enabled_C25 || !hasRealMaterial) && node.Extras is JsonObject nodeExtras)
+        // hidden-in-game signals: disabled renderer always; placeholder-only
+        // material (utility geometry like IO wiring origins) unless opted out
+        if ((!renderer.Enabled_C25 || (options.HideUtility && !hasRealMaterial))
+            && node.Extras is JsonObject nodeExtras)
         {
             nodeExtras["unity_hidden"] = true;
         }

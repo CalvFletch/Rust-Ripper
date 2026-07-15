@@ -173,6 +173,7 @@ internal static class Cli
                 case "--paint-nodes": options = options with { PaintNodes = true }; break;
                 case "--no-lights": options = options with { IncludeLights = false }; break;
                 case "--keep-chains": options = options with { CollapseEmptyChains = false }; break;
+                case "--show-utility": options = options with { HideUtility = false }; break;
                 default: queryParts.Add(args[i]); break;
             }
         }
@@ -343,6 +344,7 @@ internal static class Cli
                             PaintNodes = request.QueryString["paint-nodes"] != null,
                             IncludeLights = request.QueryString["no-lights"] == null,
                             CollapseEmptyChains = request.QueryString["keep-chains"] == null,
+                            HideUtility = request.QueryString["show-utility"] == null,
                         };
                         var result = session.ExportGlb(q, outDir, options);
                         WriteJson(context, result.Success ? 200 : 404, new { success = result.Success, message = result.Message, path = result.Path, seconds = result.Seconds });
