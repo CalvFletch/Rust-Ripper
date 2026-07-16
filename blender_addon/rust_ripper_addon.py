@@ -935,6 +935,72 @@ class RUST_OT_show_all_lights(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class RUST_OT_add_ik_controls(bpy.types.Operator):
+    bl_idname = "rust.add_ik_controls"
+    bl_label = "Add IK Controls"
+    bl_description = ("Add IK target bones to the active armature's limb chains "
+                      "(topology-based: chains of 3+ bones hanging off a branch point). "
+                      "FK animation still plays; disable a chain's IK influence to pose FK")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object is not None and context.active_object.type == "ARMATURE"
+
+    def execute(self, context):
+        arm_obj = context.active_object
+        bones = arm_obj.data.bones
+
+        # topology: a limb chain starts on a child of a branch point and
+        # runs through single-child bones; IK the ones with 3+ segments
+        chains = []
+        branch_children = [b for b in bones if b.parent is not None and len(b.parent.children) >= 2]
+        for start in branch_children:
+            chain = [start]
+            current = start
+            while len(current.children) == 1:
+                current = current.children[0]
+                chain.append(current)
+            if len(chain) >= 3:
+                chains.append([b.name for b in chain])
+
+        if not chains:
+            self.report({"WARNING"}, "no limb chains found (need 3+ bone runs off a branch point)")
+            return {"CANCELLED"}
+
+        bpy.ops.object.mode_set(mode="EDIT")
+        edit = arm_obj.data.edit_bones
+        targets = []
+        for chain in chains:
+            end = edit[chain[-1]]
+            name = f"IK_{chain[-1]}"
+            if name in edit:
+                continue
+            control = edit.new(name)
+            control.head = end.head.copy()
+            control.tail = end.head + (end.tail - end.head) * 2.0
+            control.use_deform = False
+            targets.append((name, chain))
+        bpy.ops.object.mode_set(mode="POSE")
+        for name, chain in targets:
+            # constraint sits on the bone ABOVE the chain end; the end bone
+            # follows the control's rotation so feet stay plantable
+            mid = arm_obj.pose.bones[chain[-2]]
+            ik = mid.constraints.new("IK")
+            ik.target = arm_obj
+            ik.subtarget = name
+            ik.chain_count = len(chain) - 1
+            end = arm_obj.pose.bones[chain[-1]]
+            copy = end.constraints.new("COPY_ROTATION")
+            copy.target = arm_obj
+            copy.subtarget = name
+            control = arm_obj.pose.bones[name]
+            control.color.palette = "THEME01"
+        bpy.ops.object.mode_set(mode="OBJECT")
+        self.report({"INFO"}, f"{len(targets)} IK controls added (IK_* bones, red)")
+        return {"FINISHED"}
+
+
 # ---------------------------------------------------------------- panels
 
 class RUST_PT_main(bpy.types.Panel):
@@ -965,6 +1031,8 @@ class RUST_PT_main(bpy.types.Panel):
         row = layout.row(align=True)
         row.operator("rust.hide_fill_lights", icon="LIGHT_SUN")
         row.operator("rust.show_all_lights", icon="HIDE_OFF")
+        layout.separator()
+        layout.operator("rust.add_ik_controls", icon="CON_KINEMATIC")
 
 
 # ---------------------------------------------------------------- menu hook
@@ -991,6 +1059,7 @@ classes = (
     RUST_OT_disconnect_bridge,
     RUST_OT_hide_fill_lights,
     RUST_OT_show_all_lights,
+    RUST_OT_add_ik_controls,
     RUST_PT_main,
 )
 

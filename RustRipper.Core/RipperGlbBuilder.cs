@@ -405,6 +405,9 @@ public class RipperGlbBuilder
                 if (bone.GameObject_C4P is { } boneGo)
                 {
                     boneKeep.Add(boneGo.PathID);
+                    // animation plays in each bone's original local space:
+                    // no ancestor may be dissolved into it
+                    KeepAncestors(boneGo, boneKeep);
                 }
             }
             if (skinned.RootBone.TryGetAsset(skinned.Collection) is ITransform rootBone
@@ -479,6 +482,11 @@ public class RipperGlbBuilder
                     if (pathMap.TryGetValue(path, out var target))
                     {
                         animatedKeep.Add(target.PathID);
+                        // clip values assume the ORIGINAL local space: if an
+                        // ancestor were dissolved, its matrix would fold into
+                        // this node's static transform and every keyframe
+                        // would play offset - keep the whole chain
+                        KeepAncestors(target, animatedKeep);
                     }
                 }
             }
@@ -549,6 +557,19 @@ public class RipperGlbBuilder
                     }
                 }
             }
+        }
+    }
+
+    private static void KeepAncestors(IGameObject gameObject, HashSet<long> keepSet)
+    {
+        var transform = gameObject.GetTransform().Father_C4P;
+        while (transform is not null)
+        {
+            if (transform.GameObject_C4P is { } ancestor && !keepSet.Add(ancestor.PathID))
+            {
+                break;
+            }
+            transform = transform.Father_C4P;
         }
     }
 
