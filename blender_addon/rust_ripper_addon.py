@@ -191,7 +191,7 @@ def _wire_uv(tree, tex_node, mat, objects, uv_index, entry, label):
 
 
 _BLEND_LAYER_GROUP = "Rust/Standard Blend Layer"
-_GROUP_VERSION = 2
+_GROUP_VERSION = 3
 
 
 def _blend_layer_group():
@@ -235,7 +235,13 @@ def _blend_layer_group():
     socket("_DetailBlendFactor", "INPUT", "NodeSocketFloat", 8.0)
     socket("_DetailBlendFalloff", "INPUT", "NodeSocketFloat", 1.0)
     socket("_DetailBlendMaskMapInvert", "INPUT", "NodeSocketFloat", 0.0)
+    socket("Base Metallic", "INPUT", "NodeSocketFloat", 0.0)
+    socket("Base Roughness", "INPUT", "NodeSocketFloat", 1.0)
+    socket("Layer Metallic", "INPUT", "NodeSocketFloat", 0.0)
+    socket("Layer Roughness", "INPUT", "NodeSocketFloat", 1.0)
     socket("Color", "OUTPUT", "NodeSocketColor")
+    socket("Metallic", "OUTPUT", "NodeSocketFloat")
+    socket("Roughness", "OUTPUT", "NodeSocketFloat")
     socket("Blend Factor", "OUTPUT", "NodeSocketFloat")
 
     nodes, links = group.nodes, group.links
@@ -302,10 +308,76 @@ def _blend_layer_group():
     links.new(group_in.outputs["Base Color"], blend.inputs[6])
     links.new(tinted.outputs[2], blend.inputs[7])
 
+    def float_lerp(label, a_name, b_name):
+        node = nodes.new("ShaderNodeMix")
+        node.data_type = "FLOAT"
+        node.label = label
+        links.new(clamped.outputs[0], node.inputs[0])
+        links.new(group_in.outputs[a_name], node.inputs[2])
+        links.new(group_in.outputs[b_name], node.inputs[3])
+        return node
+
+    metal_mix = float_lerp("metallic by blend", "Base Metallic", "Layer Metallic")
+    rough_mix = float_lerp("roughness by blend", "Base Roughness", "Layer Roughness")
+
     links.new(blend.outputs[2], group_out.inputs["Color"])
+    links.new(metal_mix.outputs[0], group_out.inputs["Metallic"])
+    links.new(rough_mix.outputs[0], group_out.inputs["Roughness"])
     links.new(clamped.outputs[0], group_out.inputs["Blend Factor"])
     _arrange_nodes(group)
     return group
+
+
+def _wire_layer_metal_rough(tree, mat, objects, layer_node, glb_path, floats,
+                            mg_slot, sg_slot, metallic_float, gloss_float, uv_index, label):
+    """Feed a layer group's metal/rough inputs from the layer's own maps,
+    using the exporter's established conversions: metal-gloss R=metal
+    A=smoothness (roughness = 1 - A x glossiness), spec-gloss A=gloss
+    (roughness only). Without a map, the material's own floats apply."""
+    nodes, links = tree.nodes, tree.links
+    mg_entry = _texture_entry(mat, mg_slot) if mg_slot else None
+    sg_entry = _texture_entry(mat, sg_slot) if sg_slot else None
+    entry = mg_entry or sg_entry
+    path = entry and _sidecar_path(glb_path, entry["name"])
+    gloss_scale = floats.get(gloss_float, 1.0) if gloss_float else 1.0
+    if path:
+        img = bpy.data.images.load(path, check_existing=True)
+        img.colorspace_settings.name = "Non-Color"
+        tex = nodes.new("ShaderNodeTexImage")
+        tex.image = img
+        tex.label = f"{label} metal-gloss"
+        _wire_uv(tree, tex, mat, objects, uv_index, entry, f"{label} mg")
+        rough = nodes.new("ShaderNodeMath")
+        rough.operation = "MULTIPLY_ADD"
+        rough.label = f"1 - gloss x {gloss_float or 'scale'}"
+        rough.inputs[1].default_value = -gloss_scale
+        rough.inputs[2].default_value = 1.0
+        links.new(tex.outputs["Alpha"], rough.inputs[0])
+        links.new(rough.outputs[0], layer_node.inputs["Layer Roughness"])
+        if mg_entry:
+            sep = nodes.new("ShaderNodeSeparateColor")
+            sep.label = f"{label} metal (R)"
+            links.new(tex.outputs["Color"], sep.inputs["Color"])
+            links.new(sep.outputs["Red"], layer_node.inputs["Layer Metallic"])
+        else:
+            layer_node.inputs["Layer Metallic"].default_value = floats.get(metallic_float, 0.0) if metallic_float else 0.0
+    else:
+        layer_node.inputs["Layer Metallic"].default_value = floats.get(metallic_float, 0.0) if metallic_float else 0.0
+        layer_node.inputs["Layer Roughness"].default_value = 1.0 - gloss_scale
+
+
+def _route_metal_rough_through(tree, bsdf, layer_node):
+    """Re-route the BSDF's metallic/roughness through a layer group: current
+    sources become the group's Base inputs, outputs drive the BSDF."""
+    links = tree.links
+    for bsdf_input, base_socket, out_socket in (
+            (bsdf.inputs["Metallic"], "Base Metallic", "Metallic"),
+            (bsdf.inputs["Roughness"], "Base Roughness", "Roughness")):
+        if bsdf_input.is_linked:
+            links.new(bsdf_input.links[0].from_socket, layer_node.inputs[base_socket])
+        else:
+            layer_node.inputs[base_socket].default_value = bsdf_input.default_value
+        links.new(layer_node.outputs[out_socket], bsdf_input)
 
 
 def _build_blend_layer_nodes(glb_path, materials, objects):
@@ -399,6 +471,10 @@ def _build_blend_layer_nodes(glb_path, materials, objects):
         else:
             layer.inputs["Base Color"].default_value = base_input.default_value
         links.new(layer.outputs["Color"], base_input)
+        _wire_layer_metal_rough(tree, mat, objects, layer, glb_path, floats,
+                                "_DetailMetallicGlossMap", None, "_DetailMetallic", "_DetailGlossiness",
+                                int(floats.get("_UVSec", 0.0)), "_Detail")
+        _route_metal_rough_through(tree, bsdf, layer)
         built += 1
     return built
 
@@ -417,11 +493,11 @@ def _blend4way_group():
         out   = lerp(base, layer, blend)
     """
     group = bpy.data.node_groups.get(_BLEND4WAY_GROUP)
-    if group is not None and group.get("rust_ripper_version", 0) >= 1:
+    if group is not None and group.get("rust_ripper_version", 0) >= 2:
         return group
     if group is None:
         group = bpy.data.node_groups.new(_BLEND4WAY_GROUP, "ShaderNodeTree")
-    group["rust_ripper_version"] = 1
+    group["rust_ripper_version"] = 2
     group.use_fake_user = True
 
     present = {(item.name, item.in_out) for item in group.interface.items_tree
@@ -444,7 +520,13 @@ def _blend4way_group():
     socket("_BlendFactor", "INPUT", "NodeSocketFloat", 8.0)
     socket("_BlendFalloff", "INPUT", "NodeSocketFloat", 1.0)
     socket("_BlendMaskMapInvert", "INPUT", "NodeSocketFloat", 0.0)
+    socket("Base Metallic", "INPUT", "NodeSocketFloat", 0.0)
+    socket("Base Roughness", "INPUT", "NodeSocketFloat", 1.0)
+    socket("Layer Metallic", "INPUT", "NodeSocketFloat", 0.0)
+    socket("Layer Roughness", "INPUT", "NodeSocketFloat", 1.0)
     socket("Color", "OUTPUT", "NodeSocketColor")
+    socket("Metallic", "OUTPUT", "NodeSocketFloat")
+    socket("Roughness", "OUTPUT", "NodeSocketFloat")
     socket("Blend Factor", "OUTPUT", "NodeSocketFloat")
 
     nodes, links = group.nodes, group.links
@@ -517,7 +599,21 @@ def _blend4way_group():
     links.new(group_in.outputs["Base Color"], blend.inputs[6])
     links.new(tint_pick.outputs[2], blend.inputs[7])
 
+    def float_lerp(label, a_name, b_name):
+        node = nodes.new("ShaderNodeMix")
+        node.data_type = "FLOAT"
+        node.label = label
+        links.new(clamped.outputs[0], node.inputs[0])
+        links.new(group_in.outputs[a_name], node.inputs[2])
+        links.new(group_in.outputs[b_name], node.inputs[3])
+        return node
+
+    metal_mix = float_lerp("metallic by blend", "Base Metallic", "Layer Metallic")
+    rough_mix = float_lerp("roughness by blend", "Base Roughness", "Layer Roughness")
+
     links.new(blend.outputs[2], group_out.inputs["Color"])
+    links.new(metal_mix.outputs[0], group_out.inputs["Metallic"])
+    links.new(rough_mix.outputs[0], group_out.inputs["Roughness"])
     links.new(clamped.outputs[0], group_out.inputs["Blend Factor"])
     _arrange_nodes(group)
     return group
@@ -602,6 +698,13 @@ def _build_blend4way_nodes(glb_path, materials, objects):
             else:
                 layer.inputs["Base Color"].default_value = base_input.default_value
             chain_socket = layer.outputs["Color"]
+            # metal/rough chain: routing through each layer in order makes
+            # the previous layer's output the next one's base automatically
+            _wire_layer_metal_rough(tree, mat, objects, layer, glb_path, floats,
+                                    f"_BlendLayer{n}_MetallicGlossMap", f"_BlendLayer{n}_SpecGlossMap",
+                                    f"_BlendLayer{n}_Metallic", f"_BlendLayer{n}_Glossiness",
+                                    int(floats.get(f"_BlendLayer{n}_UVSet", 0.0)), f"_BlendLayer{n}")
+            _route_metal_rough_through(tree, bsdf, layer)
         links.new(chain_socket, base_input)
         built += 1
     return built
