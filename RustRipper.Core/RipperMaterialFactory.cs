@@ -26,15 +26,24 @@ public class RipperMaterialFactory
     /// <summary>Materials whose detail-layer paint was baked: PathID -> _DetailColor (as authored, sRGB).</summary>
     public Dictionary<long, System.Numerics.Vector4> DetailPaint { get; } = new();
 
-    /// <summary>Materials whose detail layer is tinted at RUNTIME: detail layer
-    /// on with a detail albedo map, authored colour neutral (the game supplies
-    /// the colour, e.g. from a palette lookup). Never baked - the layer data
-    /// ships intact and palette attributes let consumers pick the colour.</summary>
-    public HashSet<long> RuntimeTintMaterials { get; } = new();
+    /// <summary>Materials with an active texture-composited layer (detail/blend
+    /// layer with a detail albedo, numbered 4-way layers, terrain layer):
+    /// never flattened - the layer data rides in extras and the layer
+    /// textures ship as sidecars.</summary>
+    public HashSet<long> LayeredMaterials { get; } = new();
 
-    /// <summary>The runtime-tinted material assets themselves, for sidecar
+    /// <summary>The layered material assets themselves, for sidecar
     /// delivery of their layer textures (blend masks, tint maps...).</summary>
-    public List<IMaterial> RuntimeTintMaterialAssets { get; } = new();
+    public List<IMaterial> LayeredMaterialAssets { get; } = new();
+
+    /// <summary>Materials whose detail layer is tinted at RUNTIME by the game
+    /// (construction paint): _DetailTintSource 0 selects the per-instance
+    /// colour path in the compiled shader, and the _DetailTintMap texture
+    /// identifies WHICH palette - it is the Sample texture of a
+    /// ConstructionSkin_ColourLookup asset. The exporter joins the texture
+    /// back to its lookup; materials whose tint map matches no lookup are
+    /// simply not palette-tinted and get no attributes.</summary>
+    public List<(IMaterial Material, ITexture2D TintMap)> PaletteTintCandidates { get; } = new();
 
     /// <summary>Paint-node mode: mask textures per painted material, for sidecar export.</summary>
     public Dictionary<long, (string MaterialName, ITexture2D Mask)> DetailMasks { get; } = new();
@@ -93,6 +102,10 @@ public class RipperMaterialFactory
                     ["name"] = slotTexture.Name.String,
                     ["scale"] = new System.Text.Json.Nodes.JsonArray(texEnv.Scale.X, texEnv.Scale.Y),
                     ["offset"] = new System.Text.Json.Nodes.JsonArray(texEnv.Offset.X, texEnv.Offset.Y),
+                    // Texture2D ColorSpace: 1 = sRGB (sampler decodes to linear
+                    // before the shader sees the texel), 0 = linear/raw.
+                    // Polarity anchored empirically: albedos are 1, normals 0.
+                    ["srgb"] = slotTexture.ColorSpace_C28 == 1,
                 };
             }
         }
@@ -187,9 +200,19 @@ public class RipperMaterialFactory
             // texture set, mask, tiling; colour authored or runtime-supplied) -
             // never flattened here, all layer data rides in extras and the
             // layer textures ship as sidecars
-            if (RuntimeTintMaterials.Add(material.PathID))
+            if (LayeredMaterials.Add(material.PathID))
             {
-                RuntimeTintMaterialAssets.Add(material);
+                LayeredMaterialAssets.Add(material);
+                // runtime construction paint candidates: per-instance colour
+                // engages when _DetailTintSource is 0 (compiled-shader fact)
+                // AND the tint map names the palette. 0 is also the serialized
+                // default, so the tint-map join downstream is what decides.
+                if ((detailLayerOn || blendLayerOn) && detailAlbedo is not null
+                    && floats.TryGetValue("_DetailTintSource", out var tintSource) && tintSource == 0f
+                    && GetTexture(material, "_DetailTintMap") is { } tintMap)
+                {
+                    PaletteTintCandidates.Add((material, tintMap));
+                }
             }
         }
         var baseColorSet = false;

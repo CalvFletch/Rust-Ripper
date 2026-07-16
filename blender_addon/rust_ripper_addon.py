@@ -404,10 +404,13 @@ def _build_blend_layer_nodes(glb_path, materials, objects):
         attrs = _material_color_attributes(mat, objects)
         nodes, links = tree.nodes, tree.links
 
-        def image_node(path, label, non_color):
+        def image_node(path, label, entry, default_srgb):
+            # the exporter records each texture's ColorSpace: Gamma-flagged
+            # textures are sRGB-DECODED by the sampler before the shader sees
+            # them - Blender must match or every mask threshold shifts
             img = bpy.data.images.load(path, check_existing=True)
-            if non_color:
-                img.colorspace_settings.name = "Non-Color"
+            srgb = entry.get("srgb", default_srgb) if entry else default_srgb
+            img.colorspace_settings.name = "sRGB" if srgb else "Non-Color"
             node = nodes.new("ShaderNodeTexImage")
             node.image = img
             node.label = label
@@ -421,7 +424,7 @@ def _build_blend_layer_nodes(glb_path, materials, objects):
         layer.inputs["_DetailBlendFalloff"].default_value = floats.get("_DetailBlendFalloff", 1.0)
         layer.inputs["_DetailBlendMaskMapInvert"].default_value = floats.get("_DetailBlendMaskMapInvert", 0.0)
 
-        mask_node = image_node(mask_path, "_DetailBlendMaskMap", non_color=True)
+        mask_node = image_node(mask_path, "_DetailBlendMaskMap", mask_entry, default_srgb=False)
         if floats.get("_DetailBlendMaskAddLowFreq", 0.0) != 0.0:
             mask_node.label += " (AddLowFreq second sample not built)"
         _wire_uv(tree, mask_node, mat, objects,
@@ -441,7 +444,7 @@ def _build_blend_layer_nodes(glb_path, materials, objects):
                 links.new(vcol.outputs["Color"], vsep.inputs["Color"])
                 links.new(vsep.outputs["Red"], layer.inputs["Vertex Weight"])
 
-        detail_node = image_node(detail_path, "_DetailAlbedoMap", non_color=False)
+        detail_node = image_node(detail_path, "_DetailAlbedoMap", detail_entry, default_srgb=True)
         _wire_uv(tree, detail_node, mat, objects,
                  int(floats.get("_UVSec", 0.0)), detail_entry, "_DetailAlbedoMap")
         links.new(detail_node.outputs["Color"], layer.inputs["Detail Albedo"])
@@ -673,6 +676,8 @@ def _build_blend4way_nodes(glb_path, materials, objects):
                 layer.inputs["Layer Color"].default_value = (*[c ** 2.2 for c in authored[:3]], 1.0)
 
             img = bpy.data.images.load(albedo_path, check_existing=True)
+            # sampler colour space comes from the texture asset (extras srgb)
+            img.colorspace_settings.name = "sRGB" if albedo_entry.get("srgb", True) else "Non-Color"
             albedo_node = nodes.new("ShaderNodeTexImage")
             albedo_node.image = img
             albedo_node.label = f"_BlendLayer{n}_AlbedoMap"
@@ -682,7 +687,7 @@ def _build_blend4way_nodes(glb_path, materials, objects):
             links.new(albedo_node.outputs["Alpha"], layer.inputs["Layer Albedo Alpha"])
 
             mask_img = bpy.data.images.load(mask_path, check_existing=True)
-            mask_img.colorspace_settings.name = "Non-Color"
+            mask_img.colorspace_settings.name = "sRGB" if mask_entry.get("srgb", False) else "Non-Color"
             mask_node = nodes.new("ShaderNodeTexImage")
             mask_node.image = mask_img
             mask_node.label = f"_BlendLayer{n}_BlendMaskMap"
