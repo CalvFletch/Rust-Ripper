@@ -721,7 +721,13 @@ def _import_glb(context, filepath):
     painted = _build_paint_nodes(filepath, new_materials)
     painted += _build_blend_layer_nodes(filepath, new_materials, new_objects)
     painted += _build_blend4way_nodes(filepath, new_materials, new_objects)
-    painted += _build_fur_alpha_nodes(filepath, new_materials, new_objects)
+    fur = _build_fur_alpha_nodes(filepath, new_materials, new_objects)
+    painted += fur
+    if fur and context.scene.render.engine == "CYCLES":
+        # fur shells stack many alpha layers; rays that exhaust Cycles'
+        # transparent bounce budget terminate BLACK between the tufts
+        cycles = context.scene.cycles
+        cycles.transparent_max_bounces = max(cycles.transparent_max_bounces, 64)
     # NOTE: nodes should always be created neatly. The current _arrange_nodes is
     # a basic left-to-right layout. Research better programmatic shader layout
     # methods (e.g. graphviz-style Sugiyama, or Blender's node.dimensions-based
