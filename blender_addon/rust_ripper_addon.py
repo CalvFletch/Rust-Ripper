@@ -151,6 +151,45 @@ def _material_color_attributes(mat, objects):
     return names
 
 
+def _uv_map_name(mat, objects, index):
+    """The nth UV layer name on the meshes using this material (None = default)."""
+    if index <= 0:
+        return None
+    for obj in objects:
+        if obj.type == "MESH" and any(slot.material is mat for slot in obj.material_slots):
+            layers = obj.data.uv_layers
+            if len(layers) > index:
+                return layers[index].name
+    return None
+
+
+def _wire_uv(tree, tex_node, mat, objects, uv_index, entry, label):
+    """Feed a texture node the UV set the material data selects, with the
+    slot's Unity tiling when authored (UVMap -> Mapping -> Vector)."""
+    nodes, links = tree.nodes, tree.links
+    scale = list(entry.get("scale", [1.0, 1.0])) if entry else [1.0, 1.0]
+    offset = list(entry.get("offset", [0.0, 0.0])) if entry else [0.0, 0.0]
+    uv_name = _uv_map_name(mat, objects, uv_index)
+    tiled = scale != [1.0, 1.0] or offset != [0.0, 0.0]
+    if not uv_name and not tiled:
+        return
+    source = None
+    if uv_name or tiled:
+        uv = nodes.new("ShaderNodeUVMap")
+        if uv_name:
+            uv.uv_map = uv_name
+            uv.label = f"{label} UV{uv_index}"
+        source = uv.outputs["UV"]
+    if tiled:
+        mapping = nodes.new("ShaderNodeMapping")
+        mapping.label = f"{label} tiling (data)"
+        mapping.inputs["Scale"].default_value = (scale[0], scale[1], 1.0)
+        mapping.inputs["Location"].default_value = (offset[0], offset[1], 0.0)
+        links.new(source, mapping.inputs["Vector"])
+        source = mapping.outputs["Vector"]
+    links.new(source, tex_node.inputs["Vector"])
+
+
 _BLEND_LAYER_GROUP = "Rust/Standard Blend Layer"
 _GROUP_VERSION = 2
 
@@ -313,6 +352,8 @@ def _build_blend_layer_nodes(glb_path, materials, objects):
         mask_node = image_node(mask_path, "_DetailBlendMaskMap", non_color=True)
         if floats.get("_DetailBlendMaskAddLowFreq", 0.0) != 0.0:
             mask_node.label += " (AddLowFreq second sample not built)"
+        _wire_uv(tree, mask_node, mat, objects,
+                 int(floats.get("_DetailBlendMaskUVSet", 0.0)), mask_entry, "_DetailBlendMaskMap")
         links.new(mask_node.outputs["Color"], layer.inputs["Mask"])
 
         # meshes without a colour stream read (1,1,1,1) in Unity: leave weight at 1
@@ -329,16 +370,8 @@ def _build_blend_layer_nodes(glb_path, materials, objects):
                 links.new(vsep.outputs["Red"], layer.inputs["Vertex Weight"])
 
         detail_node = image_node(detail_path, "_DetailAlbedoMap", non_color=False)
-        scale = list(detail_entry.get("scale", [1.0, 1.0]))
-        offset = list(detail_entry.get("offset", [0.0, 0.0]))
-        if scale != [1.0, 1.0] or offset != [0.0, 0.0]:
-            mapping = nodes.new("ShaderNodeMapping")
-            mapping.label = "_DetailAlbedoMap tiling (data)"
-            mapping.inputs["Scale"].default_value = (scale[0], scale[1], 1.0)
-            mapping.inputs["Location"].default_value = (offset[0], offset[1], 0.0)
-            uv = nodes.new("ShaderNodeUVMap")
-            links.new(uv.outputs["UV"], mapping.inputs["Vector"])
-            links.new(mapping.outputs["Vector"], detail_node.inputs["Vector"])
+        _wire_uv(tree, detail_node, mat, objects,
+                 int(floats.get("_UVSec", 0.0)), detail_entry, "_DetailAlbedoMap")
         links.new(detail_node.outputs["Color"], layer.inputs["Detail Albedo"])
 
         # weight = vcol.a x tint.a in the compiled shader: alpha rides along
@@ -509,7 +542,7 @@ def _build_blend4way_nodes(glb_path, materials, objects):
             albedo_path = albedo_entry and _sidecar_path(glb_path, albedo_entry["name"])
             mask_path = mask_entry and _sidecar_path(glb_path, mask_entry["name"])
             if albedo_path and mask_path:
-                layers.append((n, albedo_entry, albedo_path, mask_path))
+                layers.append((n, albedo_entry, albedo_path, mask_entry, mask_path))
         if not layers:
             continue
         tree = mat.node_tree
@@ -531,7 +564,7 @@ def _build_blend4way_nodes(glb_path, materials, objects):
 
         base_input = bsdf.inputs["Base Color"]
         chain_socket = base_input.links[0].from_socket if base_input.is_linked else None
-        for n, albedo_entry, albedo_path, mask_path in layers:
+        for n, albedo_entry, albedo_path, mask_entry, mask_path in layers:
             layer = nodes.new("ShaderNodeGroup")
             layer.node_tree = _blend4way_group()
             layer.label = f"_BlendLayer{n}"
@@ -547,16 +580,8 @@ def _build_blend4way_nodes(glb_path, materials, objects):
             albedo_node = nodes.new("ShaderNodeTexImage")
             albedo_node.image = img
             albedo_node.label = f"_BlendLayer{n}_AlbedoMap"
-            scale = list(albedo_entry.get("scale", [1.0, 1.0]))
-            offset = list(albedo_entry.get("offset", [0.0, 0.0]))
-            if scale != [1.0, 1.0] or offset != [0.0, 0.0]:
-                mapping = nodes.new("ShaderNodeMapping")
-                mapping.label = f"_BlendLayer{n} tiling (data)"
-                mapping.inputs["Scale"].default_value = (scale[0], scale[1], 1.0)
-                mapping.inputs["Location"].default_value = (offset[0], offset[1], 0.0)
-                uv = nodes.new("ShaderNodeUVMap")
-                links.new(uv.outputs["UV"], mapping.inputs["Vector"])
-                links.new(mapping.outputs["Vector"], albedo_node.inputs["Vector"])
+            _wire_uv(tree, albedo_node, mat, objects,
+                     int(floats.get(f"_BlendLayer{n}_UVSet", 0.0)), albedo_entry, f"_BlendLayer{n}")
             links.new(albedo_node.outputs["Color"], layer.inputs["Layer Albedo"])
             links.new(albedo_node.outputs["Alpha"], layer.inputs["Layer Albedo Alpha"])
 
@@ -565,6 +590,8 @@ def _build_blend4way_nodes(glb_path, materials, objects):
             mask_node = nodes.new("ShaderNodeTexImage")
             mask_node.image = mask_img
             mask_node.label = f"_BlendLayer{n}_BlendMaskMap"
+            _wire_uv(tree, mask_node, mat, objects,
+                     int(floats.get(f"_BlendLayer{n}_BlendMaskUVSet", 0.0)), mask_entry, f"_BlendLayer{n} mask")
             links.new(mask_node.outputs["Color"], layer.inputs["Mask"])
 
             if weight_sep is not None:
