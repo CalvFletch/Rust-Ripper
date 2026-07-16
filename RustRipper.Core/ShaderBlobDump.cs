@@ -38,7 +38,8 @@ public static class ShaderBlobDump
     private sealed record Variant(
         int SubShader, int Pass, string PassName, string Stage,
         uint BlobIndex, int GpuProgramType, string[] Keywords,
-        ISerializedSubProgram? SubProgram, ISerializedPass PassAsset)
+        ISerializedSubProgram? SubProgram, ISerializedPass PassAsset,
+        ISerializedProgram? Program = null, int Tier = -1, int TierIndex = -1)
     {
         public string LightMode
         {
@@ -63,7 +64,8 @@ public static class ShaderBlobDump
     }
 
     public static object Dump(IShader shader, string outDir, string stage,
-        string[] keywordFilter, string platformFilter, int maxDisassemblies)
+        string[] keywordFilter, string platformFilter, int maxDisassemblies,
+        int rawEntryIndex = -1)
     {
         var notes = new List<string>();
         var written = new List<string>();
@@ -80,6 +82,7 @@ public static class ShaderBlobDump
         var platformInfos = new List<object>();
         var variantSummaries = new List<object>();
         var disassemblies = new List<object>();
+        object? globalsUnion = null;
 
         // --- variants come from the parsed form, shared across platforms
         List<Variant> variants = CollectVariants(shader, notes);
@@ -148,6 +151,72 @@ public static class ShaderBlobDump
                 continue;
             }
 
+            // shader-wide $Globals register map: union of every parseable
+            // parameter entry plus all passes' CommonParameters. A name that
+            // ever maps to two offsets is reported as conflicted, never trusted.
+            if (globalsUnion is null)
+            {
+                var offsetsByName = new Dictionary<string, HashSet<int>>();
+                var slotsByTexture = new Dictionary<string, HashSet<int>>();
+                for (int idx = 0; idx < entries.Length; idx++)
+                {
+                    if (entries[idx].Length < 28 || entries[idx].Length > 65536)
+                    {
+                        continue;
+                    }
+                    var bytes = segments[entries[idx].Segment].AsSpan(entries[idx].Offset, entries[idx].Length).ToArray();
+                    if (ShaderParameterBlob.TryParse(bytes, out _) is not { } parsedEntry)
+                    {
+                        continue;
+                    }
+                    foreach (var cb in parsedEntry.ConstantBuffers.Where(c => c.Name == "$Globals"))
+                    {
+                        foreach (var vp in cb.Params)
+                        {
+                            offsetsByName.TryAdd(vp.Name, new HashSet<int>());
+                            offsetsByName[vp.Name].Add(vp.ByteOffset);
+                        }
+                    }
+                    foreach (var tex in parsedEntry.Textures)
+                    {
+                        slotsByTexture.TryAdd(tex.Name, new HashSet<int>());
+                        slotsByTexture[tex.Name].Add(tex.Slot);
+                    }
+                }
+                foreach (var (name, offset) in CollectCommonGlobals(shader))
+                {
+                    offsetsByName.TryAdd(name, new HashSet<int>());
+                    offsetsByName[name].Add(offset);
+                }
+                globalsUnion = new
+                {
+                    platform = platformName,
+                    stable = offsetsByName.Where(kv => kv.Value.Count == 1)
+                        .Select(kv => new
+                        {
+                            name = kv.Key,
+                            byteOffset = kv.Value.First(),
+                            register = $"c{kv.Value.First() / 16}.{"xyzw"[(kv.Value.First() % 16) / 4]}",
+                        })
+                        .OrderBy(x => x.byteOffset).ToList(),
+                    conflicts = offsetsByName.Where(kv => kv.Value.Count > 1)
+                        .Select(kv => new { name = kv.Key, offsets = kv.Value.OrderBy(o => o).ToList() }).ToList(),
+                    textureSlots = slotsByTexture
+                        .Select(kv => new { name = kv.Key, slots = kv.Value.OrderBy(s => s).ToList() })
+                        .OrderBy(x => x.slots[0]).ToList(),
+                };
+            }
+
+            if (rawEntryIndex >= 0 && rawEntryIndex < entries.Length)
+            {
+                var rawEntry = entries[rawEntryIndex];
+                Directory.CreateDirectory(outDir);
+                var rawEntryPath = Path.Combine(outDir, $"{safeName}.{platformName}.entry{rawEntryIndex}.bin");
+                File.WriteAllBytes(rawEntryPath,
+                    segments[rawEntry.Segment].AsSpan(rawEntry.Offset, rawEntry.Length).ToArray());
+                written.Add(rawEntryPath);
+            }
+
             foreach (var v in matched.Take(maxDisassemblies))
             {
                 if (v.BlobIndex >= entries.Length)
@@ -174,6 +243,116 @@ public static class ShaderBlobDump
                         written.Add(disasmPath);
                     }
 
+                    // 2021.2+ player format: per-variant parameters live in their
+                    // own blob entries. There is no serialized link from a player
+                    // subprogram to its entry, so select by evidence: the correct
+                    // entry's texture slots equal the disassembly's declared
+                    // resources exactly.
+                    object? paramBlob = null;
+                    try
+                    {
+                        if (v.SubProgram is null && v.Program is not null && disasmPath is not null)
+                        {
+                            var asmText = File.ReadAllText(disasmPath);
+                            var asmSlots = System.Text.RegularExpressions.Regex
+                                .Matches(asmText, @"^dcl_resource_\w+[^\r\n]*\bt(\d+)\r?$",
+                                    System.Text.RegularExpressions.RegexOptions.Multiline)
+                                .Select(m => int.Parse(m.Groups[1].Value))
+                                .ToHashSet();
+                            // every $Globals register the program actually reads
+                            var asmGlobalsRegisters = System.Text.RegularExpressions.Regex
+                                .Matches(asmText, @"cb0\[(\d+)\]")
+                                .Select(m => int.Parse(m.Groups[1].Value))
+                                .ToHashSet();
+                            // scan EVERY blob entry: strict validation rejects
+                            // program entries, so only genuine parameter payloads
+                            // survive. Unity hoists shared params into the
+                            // program's CommonParameters, so the right entry
+                            // satisfies commons UNION blob == asm's textures.
+                            var commonSlots = CommonTextureSlots(v);
+                            var commonRegisters = CommonGlobalsRegisters(v);
+                            var matchIndices = new List<int>();
+                            ShaderParameterBlob.Result? chosen = null;
+                            int chosenIdx = -1, chosenRegisters = int.MaxValue;
+                            int parseable = 0;
+                            for (int idx = 0; idx < entries.Length; idx++)
+                            {
+                                var paramEntry = entries[idx];
+                                if (paramEntry.Length < 28 || paramEntry.Length > 65536)
+                                {
+                                    continue;
+                                }
+                                var bytes = segments[paramEntry.Segment].AsSpan(paramEntry.Offset, paramEntry.Length).ToArray();
+                                var parsedBlob = ShaderParameterBlob.TryParse(bytes, out _);
+                                if (parsedBlob is null)
+                                {
+                                    continue;
+                                }
+                                parseable++;
+                                var slots = parsedBlob.Textures.Select(t => t.Slot).ToHashSet();
+                                slots.UnionWith(commonSlots);
+                                if (!slots.SetEquals(asmSlots))
+                                {
+                                    continue;
+                                }
+                                // the entry (with commons) must explain every $Globals
+                                // register the program reads; tightest coverage wins
+                                var registers = new HashSet<int>(commonRegisters);
+                                int own = 0;
+                                foreach (var cb in parsedBlob.ConstantBuffers.Where(c => c.Name == "$Globals"))
+                                {
+                                    foreach (var vp in cb.Params)
+                                    {
+                                        int start = vp.ByteOffset / 16;
+                                        int count = Math.Max(1, vp.Fields[4]) * (vp.Fields[3] != 0 ? Math.Max(1, vp.Fields[1]) : 1);
+                                        for (int r = 0; r < count; r++)
+                                        {
+                                            registers.Add(start + r);
+                                            own++;
+                                        }
+                                    }
+                                }
+                                if (!asmGlobalsRegisters.IsSubsetOf(registers))
+                                {
+                                    continue;
+                                }
+                                matchIndices.Add(idx);
+                                if (own < chosenRegisters)
+                                {
+                                    chosen = parsedBlob;
+                                    chosenIdx = idx;
+                                    chosenRegisters = own;
+                                }
+                            }
+                            if (chosen is not null)
+                            {
+                                var chosenEntry = entries[chosenIdx];
+                                var paramPath = Path.Combine(outDir, baseName + ".params.bin");
+                                File.WriteAllBytes(paramPath,
+                                    segments[chosenEntry.Segment].AsSpan(chosenEntry.Offset, chosenEntry.Length).ToArray());
+                                written.Add(paramPath);
+                            }
+                            paramBlob = new
+                            {
+                                parseableEntries = parseable,
+                                asmTextureSlots = asmSlots.OrderBy(s => s).ToList(),
+                                asmGlobalsRegisters = asmGlobalsRegisters.OrderBy(r => r).ToList(),
+                                commonTextureSlots = commonSlots.OrderBy(s => s).ToList(),
+                                matches = matchIndices,
+                                chosen = chosenIdx,
+                                parsed = chosen?.ToReport(),
+                            };
+                            if (matchIndices.Count != 1)
+                            {
+                                notes.Add($"parameter blob: {matchIndices.Count} entries match blob {v.BlobIndex}'s texture set");
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        notes.Add($"parameter blob: {ex.Message}");
+                    }
+
                     parsed = new
                     {
                         platform = platformName,
@@ -188,6 +367,7 @@ public static class ShaderBlobDump
                         raw = rawPath,
                         disassembly = disasmPath,
                         method,
+                        paramBlob,
                         parameters = v.SubProgram != null ? ParameterInfo(v.SubProgram, v.PassAsset) : CommonParameterInfo(v, notes),
                     };
                 }
@@ -218,10 +398,54 @@ public static class ShaderBlobDump
             distinctKeywords,
             variants = variantSummaries,
             matchedForDisassembly = matched.Count,
+            globalsUnion,
             disassemblies,
             written,
             notes,
         };
+    }
+
+    /// <summary>(name, byteOffset) pairs from every pass's CommonParameters
+    /// $Globals across the whole shader - both stages, all passes.</summary>
+    private static IEnumerable<(string Name, int Offset)> CollectCommonGlobals(IShader shader)
+    {
+        var results = new List<(string, int)>();
+        try
+        {
+            foreach (var subShader in shader.ParsedForm.SubShaders)
+            {
+                foreach (var pass in subShader.Passes)
+                {
+                    var names = new Dictionary<int, string>();
+                    foreach (var pair in pass.NameIndices)
+                    {
+                        names[pair.Value] = pair.Key.String;
+                    }
+                    foreach (var prog in new[] { pass.ProgVertex, pass.ProgFragment })
+                    {
+                        if (prog?.CommonParameters is not { } common)
+                        {
+                            continue;
+                        }
+                        foreach (var cb in common.ConstantBuffers.Cast<IConstantBuffer>())
+                        {
+                            if (names.GetValueOrDefault(cb.NameIndex) != "$Globals")
+                            {
+                                continue;
+                            }
+                            foreach (var vp in cb.VectorParams)
+                            {
+                                results.Add((names.GetValueOrDefault(vp.NameIndex, $"#{vp.NameIndex}"), vp.Index));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+        return results;
     }
 
     private static string TypeName(int t) => t >= 0 && t < GpuProgramTypeNames.Length ? GpuProgramTypeNames[t] : $"type{t}";
@@ -418,14 +642,17 @@ public static class ShaderBlobDump
                     }
                     try
                     {
-                        foreach (var tier in prog.PlayerSubPrograms)
+                        for (int tierIndex = 0; tierIndex < prog.PlayerSubPrograms.Count; tierIndex++)
                         {
-                            foreach (var ps in tier)
+                            var tier = prog.PlayerSubPrograms[tierIndex];
+                            for (int k = 0; k < tier.Count; k++)
                             {
+                                var ps = tier[k];
                                 var kws = ps.KeywordIndices
                                     .Select(i => i < globalKeywords.Length ? globalKeywords[i] : $"#{i}")
                                     .ToArray();
-                                result.Add(new Variant(si, pi, passName, stageName, ps.BlobIndex, ps.GpuProgramType, kws, null, pass));
+                                result.Add(new Variant(si, pi, passName, stageName, ps.BlobIndex, ps.GpuProgramType, kws, null, pass,
+                                    prog, tierIndex, k));
                             }
                         }
                     }
@@ -507,6 +734,85 @@ public static class ShaderBlobDump
             constantBufferBindings = sub.ConstantBufferBindings.Select(b => new { name = N(b.NameIndex), slot = b.Index }).ToList(),
             textures = sub.TextureParams.Select(t => new { name = N(t.NameIndex), slot = t.Index, sampler = t.SamplerIndex }).ToList(),
         };
+    }
+
+    /// <summary>Texture slots the program-level CommonParameters already bind:
+    /// Unity hoists variant-shared parameters there and stores only the rest
+    /// per variant, so the full reflection is commons UNION param blob.</summary>
+    private static HashSet<int> CommonTextureSlots(Variant v)
+    {
+        var slots = new HashSet<int>();
+        try
+        {
+            var prog = v.Stage switch
+            {
+                "vertex" => v.PassAsset.ProgVertex,
+                "fragment" => v.PassAsset.ProgFragment,
+                _ => null,
+            };
+            if (prog?.CommonParameters is { } common)
+            {
+                foreach (var t in common.TextureParams.Cast<ITextureParameter>())
+                {
+                    slots.Add(t.Index);
+                }
+            }
+        }
+        catch
+        {
+        }
+        return slots;
+    }
+
+    /// <summary>$Globals registers covered by the program-level CommonParameters.</summary>
+    private static HashSet<int> CommonGlobalsRegisters(Variant v)
+    {
+        var registers = new HashSet<int>();
+        try
+        {
+            var prog = v.Stage switch
+            {
+                "vertex" => v.PassAsset.ProgVertex,
+                "fragment" => v.PassAsset.ProgFragment,
+                _ => null,
+            };
+            if (prog?.CommonParameters is not { } common)
+            {
+                return registers;
+            }
+            var names = new Dictionary<int, string>();
+            foreach (var pair in v.PassAsset.NameIndices)
+            {
+                names[pair.Value] = pair.Key.String;
+            }
+            foreach (var cb in common.ConstantBuffers.Cast<IConstantBuffer>())
+            {
+                if (names.GetValueOrDefault(cb.NameIndex) != "$Globals")
+                {
+                    continue;
+                }
+                foreach (var p in cb.VectorParams)
+                {
+                    int start = p.Index / 16;
+                    for (int r = 0; r < Math.Max(1, p.ArraySize); r++)
+                    {
+                        registers.Add(start + r);
+                    }
+                }
+                foreach (var m in cb.MatrixParams)
+                {
+                    int start = m.Index / 16;
+                    for (int r = 0; r < 4 * Math.Max(1, m.ArraySize); r++)
+                    {
+                        registers.Add(start + r);
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+        return registers;
     }
 
     private static object? CommonParameterInfo(Variant v, List<string> notes)

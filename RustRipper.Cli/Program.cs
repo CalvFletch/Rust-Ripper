@@ -390,7 +390,8 @@ internal static class Cli
                             request.QueryString["stage"] ?? "fragment",
                             request.QueryString["kw"] ?? "",
                             request.QueryString["plat"] ?? "",
-                            int.TryParse(request.QueryString["max"], out var maxDisasm) ? maxDisasm : 4);
+                            int.TryParse(request.QueryString["max"], out var maxDisasm) ? maxDisasm : 4,
+                            int.TryParse(request.QueryString["rawentry"], out var rawEntryIdx) ? rawEntryIdx : -1);
                         WriteJson(context, shaderReport != null ? 200 : 404, shaderReport ?? new { error = $"no shader or material matches '{q}'" });
                         break;
                     default:
@@ -1200,7 +1201,7 @@ internal sealed class Session
     /// name (or through a material that uses it) and hand it to the
     /// extraction layer. The exact blend math lives only in these programs.
     /// </summary>
-    public object? ShaderDump(string query, string outDir, string stage, string keywords, string platform, int max)
+    public object? ShaderDump(string query, string outDir, string stage, string keywords, string platform, int max, int rawEntry = -1)
     {
         var shaders = GameData.GameBundle.FetchAssets()
             .OfType<AssetRipper.SourceGenerated.Classes.ClassID_48.IShader>()
@@ -1218,7 +1219,7 @@ internal sealed class Session
             return null;
         }
         var kwFilter = keywords.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        return ShaderBlobDump.Dump(shader, outDir, stage, kwFilter, platform, max);
+        return ShaderBlobDump.Dump(shader, outDir, stage, kwFilter, platform, max, rawEntry);
     }
 
     private Dictionary<string, string>? guidToPath;
