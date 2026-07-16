@@ -794,6 +794,59 @@ def _tidy_armatures(context, objects):
         arm_obj.show_in_front = True
 
 
+def _action_bone_names(action):
+    """Bone names an action animates (Blender 5 layered-action API)."""
+    names = set()
+    try:
+        for layer in action.layers:
+            for strip in layer.strips:
+                for slot in action.slots:
+                    bag = strip.channelbag(slot)
+                    if bag:
+                        for fc in bag.fcurves:
+                            if 'pose.bones["' in fc.data_path:
+                                names.add(fc.data_path.split('"')[1])
+    except Exception:
+        pass
+    return names
+
+
+def _sequence_clips(objects, actions, prefix):
+    """Lay each armature's clips end-to-end on one NLA track: the whole
+    library is visible on the timeline in sequence, and pruning a clip is
+    deleting its strip - no sifting through the global action list. The
+    importer's own one-strip-per-clip stash tracks are folded away."""
+    armatures = [o for o in objects if o.type == "ARMATURE"]
+    for arm in armatures:
+        own = []
+        bone_names = {b.name for b in arm.data.bones}
+        for action in actions:
+            animated = _action_bone_names(action)
+            if animated and animated <= bone_names:
+                own.append(action)
+        if not own:
+            continue
+        if prefix and prefix.lower() not in arm.name.lower():
+            arm.name = f"{prefix}.rig"
+        arm.animation_data_create()
+        if arm.animation_data.nla_tracks.get("Rust Clips"):
+            continue
+        own_set = set(own)
+        for track in list(arm.animation_data.nla_tracks):
+            if track.strips and all(s.action in own_set for s in track.strips):
+                arm.animation_data.nla_tracks.remove(track)
+        track = arm.animation_data.nla_tracks.new()
+        track.name = "Rust Clips"
+        frame = 1
+        for action in sorted(own, key=lambda a: a.name):
+            length = max(1, int(action.frame_range[1] - action.frame_range[0]) + 1)
+            strip = track.strips.new(action.name, frame, action)
+            strip.extrapolation = "NOTHING"
+            frame += length + 10
+        # keep the active action empty so the sequence is what plays
+        arm.animation_data.action = None
+
+
 def _import_glb(context, filepath):
     settings = context.scene.rust_ripper
     before_objects = set(bpy.data.objects)
@@ -807,12 +860,15 @@ def _import_glb(context, filepath):
     _tidy_armatures(context, new_objects)
     # namespace actions per import so every rig's clips are findable in the
     # global action list ("wolf2|wolf_run", "chicken|walk")
-    root = next((o for o in new_objects if o.parent is None), None)
-    if root is not None:
-        prefix = root.name.split(".")[0]
+    # the export root carries unity_prefab_path (contract) - the reliable name
+    root = next((o for o in new_objects if o.get("unity_prefab_path")), None) \
+        or next((o for o in new_objects if o.parent is None), None)
+    prefix = root.name.split(".")[0] if root is not None else ""
+    if prefix:
         for action in new_actions:
             if "|" not in action.name:
                 action.name = f"{prefix}|{action.name}"
+    _sequence_clips(new_objects, new_actions, prefix)
     # animation-target empties are load-bearing (deleting them breaks clips):
     # keep them visible but small
     for obj in new_objects:
@@ -935,72 +991,6 @@ class RUST_OT_show_all_lights(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class RUST_OT_add_ik_controls(bpy.types.Operator):
-    bl_idname = "rust.add_ik_controls"
-    bl_label = "Add IK Controls"
-    bl_description = ("Add IK target bones to the active armature's limb chains "
-                      "(topology-based: chains of 3+ bones hanging off a branch point). "
-                      "FK animation still plays; disable a chain's IK influence to pose FK")
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        return context.active_object is not None and context.active_object.type == "ARMATURE"
-
-    def execute(self, context):
-        arm_obj = context.active_object
-        bones = arm_obj.data.bones
-
-        # topology: a limb chain starts on a child of a branch point and
-        # runs through single-child bones; IK the ones with 3+ segments
-        chains = []
-        branch_children = [b for b in bones if b.parent is not None and len(b.parent.children) >= 2]
-        for start in branch_children:
-            chain = [start]
-            current = start
-            while len(current.children) == 1:
-                current = current.children[0]
-                chain.append(current)
-            if len(chain) >= 3:
-                chains.append([b.name for b in chain])
-
-        if not chains:
-            self.report({"WARNING"}, "no limb chains found (need 3+ bone runs off a branch point)")
-            return {"CANCELLED"}
-
-        bpy.ops.object.mode_set(mode="EDIT")
-        edit = arm_obj.data.edit_bones
-        targets = []
-        for chain in chains:
-            end = edit[chain[-1]]
-            name = f"IK_{chain[-1]}"
-            if name in edit:
-                continue
-            control = edit.new(name)
-            control.head = end.head.copy()
-            control.tail = end.head + (end.tail - end.head) * 2.0
-            control.use_deform = False
-            targets.append((name, chain))
-        bpy.ops.object.mode_set(mode="POSE")
-        for name, chain in targets:
-            # constraint sits on the bone ABOVE the chain end; the end bone
-            # follows the control's rotation so feet stay plantable
-            mid = arm_obj.pose.bones[chain[-2]]
-            ik = mid.constraints.new("IK")
-            ik.target = arm_obj
-            ik.subtarget = name
-            ik.chain_count = len(chain) - 1
-            end = arm_obj.pose.bones[chain[-1]]
-            copy = end.constraints.new("COPY_ROTATION")
-            copy.target = arm_obj
-            copy.subtarget = name
-            control = arm_obj.pose.bones[name]
-            control.color.palette = "THEME01"
-        bpy.ops.object.mode_set(mode="OBJECT")
-        self.report({"INFO"}, f"{len(targets)} IK controls added (IK_* bones, red)")
-        return {"FINISHED"}
-
-
 # ---------------------------------------------------------------- panels
 
 class RUST_PT_main(bpy.types.Panel):
@@ -1031,8 +1021,6 @@ class RUST_PT_main(bpy.types.Panel):
         row = layout.row(align=True)
         row.operator("rust.hide_fill_lights", icon="LIGHT_SUN")
         row.operator("rust.show_all_lights", icon="HIDE_OFF")
-        layout.separator()
-        layout.operator("rust.add_ik_controls", icon="CON_KINEMATIC")
 
 
 # ---------------------------------------------------------------- menu hook
@@ -1059,7 +1047,6 @@ classes = (
     RUST_OT_disconnect_bridge,
     RUST_OT_hide_fill_lights,
     RUST_OT_show_all_lights,
-    RUST_OT_add_ik_controls,
     RUST_PT_main,
 )
 
