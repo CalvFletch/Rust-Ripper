@@ -42,9 +42,10 @@ public record RipperGlbOptions
     public bool PruneEmpties { get; init; } = true;
 
     /// <summary>Force COLOR_0 into every mesh. By default vertex colors are only
-    /// exported when a material opts in via _ApplyVertexColor/_ApplyVertexAlpha —
-    /// Rust otherwise uses them for shader masks (wind weights, AO), and glTF
-    /// viewers multiplying COLOR_0 into base color would blacken meshes.</summary>
+    /// exported when a material opts in via _ApplyVertexColor (vertex RGB
+    /// multiplied into albedo — glTF's COLOR_0 semantic) — Rust otherwise uses
+    /// them for shader masks (wind weights, AO, blend weights), and glTF
+    /// viewers multiplying COLOR_0 into base color would corrupt shading.</summary>
     public bool IncludeVertexColors { get; init; } = false;
 
     /// <summary>Leave detail paint UNBAKED for node-graph workflows: albedo stays
@@ -96,8 +97,9 @@ public class RipperGlbBuilder
 
     public IReadOnlySet<long> VertexColorTintMaterials => vertexColorTintMaterials;
     public IReadOnlyDictionary<long, System.Numerics.Vector4> DetailPaint => materials.DetailPaint;
-    public IReadOnlySet<long> RuntimeTintMaterials => materials.RuntimeTintMaterials;
-    public IReadOnlyList<AssetRipper.SourceGenerated.Classes.ClassID_21.IMaterial> RuntimeTintMaterialAssets => materials.RuntimeTintMaterialAssets;
+    public IReadOnlySet<long> LayeredMaterials => materials.LayeredMaterials;
+    public IReadOnlyList<AssetRipper.SourceGenerated.Classes.ClassID_21.IMaterial> LayeredMaterialAssets => materials.LayeredMaterialAssets;
+    public IReadOnlyList<(AssetRipper.SourceGenerated.Classes.ClassID_21.IMaterial Material, AssetRipper.SourceGenerated.Classes.ClassID_28.ITexture2D TintMap)> PaletteTintCandidates => materials.PaletteTintCandidates;
     public IReadOnlyDictionary<long, (string MaterialName, AssetRipper.SourceGenerated.Classes.ClassID_28.ITexture2D Mask)> DetailMasks => materials.DetailMasks;
 
     public static SceneBuilder Build(IGameObject root, RipperGlbOptions options)
@@ -125,15 +127,17 @@ public class RipperGlbBuilder
 
     /// <summary>
     /// Palette attributes for runtime-tinted primitives: one flat vertex-colour
-    /// attribute per palette entry (_RUST_PAINT_01..), colours straight from
-    /// the game's ColourLookup asset (sRGB authored -> linear attributes).
+    /// attribute per palette entry (_RUST_CUSTOMCOLOUR_01..), colours straight
+    /// from the game's ColourLookup asset (sRGB authored -> linear attributes).
     /// Consumers select the paint by selecting the attribute; the game's own
-    /// index (customColour, 1-based) matches the attribute number.
+    /// index (customColour, 1-based) matches the attribute number. Palettes are
+    /// PER MATERIAL - each resolved by joining the material's _DetailTintMap to
+    /// the ColourLookup whose Sample texture it is.
     /// </summary>
     public static void AddPaletteAttributes(SharpGLTF.Schema2.ModelRoot model,
-        IReadOnlySet<long> runtimeTintMaterials, IReadOnlyList<System.Numerics.Vector4> palette)
+        IReadOnlyDictionary<long, IReadOnlyList<System.Numerics.Vector4>> palettes)
     {
-        if (palette.Count == 0 || runtimeTintMaterials.Count == 0)
+        if (palettes.Count == 0)
         {
             return;
         }
@@ -142,7 +146,7 @@ public class RipperGlbBuilder
             foreach (var primitive in mesh.Primitives)
             {
                 var pathId = (primitive.Material?.Extras as JsonObject)?["unity_path_id"]?.GetValue<long>();
-                if (pathId is not { } id || !runtimeTintMaterials.Contains(id))
+                if (pathId is not { } id || !palettes.TryGetValue(id, out var palette) || palette.Count == 0)
                 {
                     continue;
                 }
@@ -1051,9 +1055,14 @@ public class RipperGlbBuilder
             {
                 hasRealMaterial = true;
             }
+            // COLOR_0 only when the shader multiplies vertex RGB into albedo
+            // (_ApplyVertexColor) - that is glTF's COLOR_0 semantic.
+            // _ApplyVertexAlpha alone modulates by ALPHA only; shipping COLOR_0
+            // for it would let viewers multiply the RGB channels in too (4-way
+            // blend WEIGHTS rendered as rainbow paint). Those colours still
+            // ship in _RUST_COLOR.
             if (material is not null
-                && ((RipperMaterialFactory.TryGetFloat(material, "_ApplyVertexColor", out var avc) && avc != 0f)
-                    || (RipperMaterialFactory.TryGetFloat(material, "_ApplyVertexAlpha", out var ava) && ava != 0f)))
+                && RipperMaterialFactory.TryGetFloat(material, "_ApplyVertexColor", out var avc) && avc != 0f)
             {
                 vertexColorTintMaterials.Add(material.PathID);
             }

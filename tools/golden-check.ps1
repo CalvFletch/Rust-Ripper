@@ -78,6 +78,11 @@ $g = Get-GlbJson $hpPath
 Assert "helipad: 4-way material present"  (($g.materials | Where-Object { $_.extras.unity_shader -like "*Blend 4-Way*" }).Count -ge 1)
 Assert "helipad: layer blend mask sidecar" (Test-Path (Join-Path (Split-Path $hpPath) "helipad.metal_grate_mask.png"))
 Assert "helipad: layer albedo sidecar"     (Test-Path (Join-Path (Split-Path $hpPath) "helipad.metal_grate_bc2.png"))
+Assert "helipad: NO palette attributes"    (-not ($g.meshes.primitives.attributes | Where-Object { $_._RUST_CUSTOMCOLOUR_01 -ne $null }))
+# COLOR_0 is legit where _ApplyVertexColor=1 (oilrig_markings decal); it must
+# never survive on 4-Way primitives, whose vertex colours are layer WEIGHTS
+$fourWayMats = @(); for ($i = 0; $i -lt $g.materials.Count; $i++) { if ($g.materials[$i].extras.unity_shader -like "*Blend 4-Way*") { $fourWayMats += $i } }
+Assert "helipad: NO COLOR_0 on 4-Way prims" (-not ($g.meshes.primitives | Where-Object { $_.attributes.COLOR_0 -ne $null -and $fourWayMats -contains $_.material }))
 
 # --- barrel: detail paint baked + paint attribute ---
 $g = Get-GlbJson (Export-Asset "loot-barrel-1")
