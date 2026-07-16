@@ -724,7 +724,7 @@ internal sealed class Session
         Directory.CreateDirectory(outDir);
         var outPath = System.IO.Path.GetFullPath(System.IO.Path.Combine(outDir, $"{resolved.Value.Name}.glb"));
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var sceneBuilder = RipperGlbBuilder.Build(resolved.Value.Root, options, out var builder);
+        var sceneBuilder = RipperGlbBuilder.Build(resolved.Value.Root, options, GameData, out var builder);
         bool ok;
         using (var fileStream = File.Create(outPath))
         {
@@ -932,6 +932,28 @@ internal sealed class Session
     /// class name). The go-to probe for "which component claims this
     /// renderer" questions.
     /// </summary>
+    /// <summary>Animator with its controller resolution state - the probe for
+    /// "why does this prefab export no animations".</summary>
+    private static string AnimatorLabel(AssetRipper.SourceGenerated.Classes.ClassID_95.IAnimator animator)
+    {
+        try
+        {
+            if (animator.Has_Controller_PPtr_RuntimeAnimatorController_5())
+            {
+                var pptr = animator.Controller_PPtr_RuntimeAnimatorController_5;
+                var resolved = animator.Controller_PPtr_RuntimeAnimatorController_5P;
+                return resolved is null
+                    ? $"Animator(controller UNRESOLVED FileID {pptr.FileID} PathID {pptr.PathID})"
+                    : $"Animator(controller={resolved.Name.String} [{resolved.ClassName}])";
+            }
+        }
+        catch (Exception ex)
+        {
+            return $"Animator(controller error: {ex.Message})";
+        }
+        return "Animator(no controller field)";
+    }
+
     public string? HierarchyReport(string query)
     {
         var resolved = ResolveExportSet(query);
@@ -941,6 +963,13 @@ internal sealed class Session
         }
         var sb = new StringBuilder();
         sb.AppendLine($"=== hierarchy for {resolved.Value.Name} ===");
+        var localControllers = resolved.Value.Root.Collection
+            .OfType<AssetRipper.SourceGenerated.Classes.ClassID_93.IRuntimeAnimatorController>()
+            .ToList();
+        if (localControllers.Count > 0)
+        {
+            sb.AppendLine($"controllers in collection: {string.Join(", ", localControllers.Select(c => $"{c.Name.String} [{c.ClassName}]"))}");
+        }
         void Walk(AssetRipper.SourceGenerated.Classes.ClassID_4.ITransform transform, int depth)
         {
             if (transform.GameObject_C4P is not { } gameObject)
@@ -957,6 +986,7 @@ internal sealed class Session
                     IMonoBehaviour monoBehaviour => $"MB:{monoBehaviour.ScriptP?.ClassName_R.String ?? "?"}",
                     AssetRipper.SourceGenerated.Classes.ClassID_205.ILODGroup lodGroup =>
                         $"LODGroup(lods={lodGroup.LODs.Count}, renderers=[{string.Join("/", lodGroup.LODs.Select(l => $"{l.Renderers.Count(rp => rp.Renderer.TryGetAsset(lodGroup.Collection, out AssetRipper.SourceGenerated.Classes.ClassID_25.IRenderer? _))}r"))}])",
+                    AssetRipper.SourceGenerated.Classes.ClassID_95.IAnimator animator => AnimatorLabel(animator),
                     _ => component.ClassName,
                 };
                 if (label != "Transform")

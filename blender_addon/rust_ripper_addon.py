@@ -33,10 +33,6 @@ class RustRipperSettings(bpy.types.PropertyGroup):
         name="Reuse existing meshes",
         description="If a mesh with the same Unity identity is already in the file, link it instead of importing a duplicate (e.g. snow and normal pines share one mesh)",
         default=True)
-    light_power_scale: FloatProperty(
-        name="Light Power",
-        description="Scale factor applied to imported light energy",
-        default=1.0, min=0.0, max=100.0)
 
 
 # ---------------------------------------------------------------- core
@@ -85,7 +81,6 @@ def _post_process(objects, settings):
                     obj.data.cutoff_distance = rng
                 if hasattr(obj.data, "shadow_soft_size"):
                     obj.data.shadow_soft_size = max(obj.data.shadow_soft_size, 0.03)
-                obj.data.energy *= settings.light_power_scale
     return hidden, reused
 
 
@@ -584,6 +579,90 @@ def _build_blend4way_nodes(glb_path, materials, objects):
     return built
 
 
+_ALPHA_CLIP_GROUP = "Rust Alpha Clip"
+
+
+def _alpha_clip_group():
+    """One tiny shared group for alpha testing: Alpha >= _Cutoff -> 1 else 0.
+    Replaces the importer's sprawling Alpha Clip frame with a single node."""
+    group = bpy.data.node_groups.get(_ALPHA_CLIP_GROUP)
+    if group is not None and group.get("rust_ripper_version", 0) >= 1:
+        return group
+    if group is None:
+        group = bpy.data.node_groups.new(_ALPHA_CLIP_GROUP, "ShaderNodeTree")
+    group["rust_ripper_version"] = 1
+    group.use_fake_user = True
+    present = {(item.name, item.in_out) for item in group.interface.items_tree
+               if getattr(item, "in_out", None)}
+
+    def socket(name, in_out, socket_type, default=None):
+        if (name, in_out) in present:
+            return
+        item = group.interface.new_socket(name=name, in_out=in_out, socket_type=socket_type)
+        if default is not None:
+            item.default_value = default
+
+    socket("Alpha", "INPUT", "NodeSocketFloat", 1.0)
+    socket("_Cutoff", "INPUT", "NodeSocketFloat", 0.5)
+    socket("Alpha", "OUTPUT", "NodeSocketFloat")
+
+    nodes, links = group.nodes, group.links
+    nodes.clear()
+    group_in = nodes.new("NodeGroupInput")
+    group_out = nodes.new("NodeGroupOutput")
+    cut = nodes.new("ShaderNodeMath")
+    cut.operation = "GREATER_THAN"
+    cut.label = "alpha >= _Cutoff"
+    links.new(group_in.outputs["Alpha"], cut.inputs[0])
+    links.new(group_in.outputs["_Cutoff"], cut.inputs[1])
+    links.new(cut.outputs[0], group_out.inputs["Alpha"])
+    _arrange_nodes(group)
+    return group
+
+
+def _compact_alpha_clips(materials):
+    """Swap the glTF importer's Alpha Clip frame (two chained math nodes) for
+    the shared Rust Alpha Clip group; cutoff comes from the material data."""
+    built = 0
+    for mat in materials:
+        if not mat or not mat.use_nodes:
+            continue
+        tree = mat.node_tree
+        frame = next((n for n in tree.nodes if n.type == "FRAME" and n.label == "Alpha Clip"), None)
+        bsdf = next((n for n in tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+        if frame is None or bsdf is None or not bsdf.inputs["Alpha"].is_linked:
+            continue
+        members = [n for n in tree.nodes if n.parent is frame]
+        # the chain's source: whatever feeds a member from outside the frame
+        source = None
+        cutoff = None
+        for n in members:
+            for sock in n.inputs:
+                for link in sock.links:
+                    if link.from_node not in members:
+                        source = link.from_socket
+            for sock in n.inputs:
+                if not sock.is_linked and sock.type == "VALUE" and sock.default_value not in (0.0, 1.0):
+                    cutoff = sock.default_value
+        if source is None:
+            continue
+        floats = mat.get("unity_floats")
+        if floats is not None and "_Cutoff" in floats.keys():
+            cutoff = floats["_Cutoff"]
+        clip = tree.nodes.new("ShaderNodeGroup")
+        clip.node_tree = _alpha_clip_group()
+        clip.label = _ALPHA_CLIP_GROUP
+        if cutoff is not None:
+            clip.inputs["_Cutoff"].default_value = cutoff
+        tree.links.new(source, clip.inputs["Alpha"])
+        tree.links.new(clip.outputs["Alpha"], bsdf.inputs["Alpha"])
+        for n in members:
+            tree.nodes.remove(n)
+        tree.nodes.remove(frame)
+        built += 1
+    return built
+
+
 def _count_fur_materials(materials):
     """Alpha-tested fur (AnimalFur): the glTF MASK import (raw albedo alpha,
     alphaCutoff = _Cutoff) is the right graph as-is - the full shader formula
@@ -681,6 +760,7 @@ def _import_glb(context, filepath):
     painted = _build_paint_nodes(filepath, new_materials)
     painted += _build_blend_layer_nodes(filepath, new_materials, new_objects)
     painted += _build_blend4way_nodes(filepath, new_materials, new_objects)
+    _compact_alpha_clips(new_materials)
     if _count_fur_materials(new_materials) and context.scene.render.engine == "CYCLES":
         # fur shells stack many alpha layers; rays that exhaust Cycles'
         # transparent bounce budget terminate BLACK between the tufts
@@ -732,18 +812,29 @@ class RUST_OT_import_glb(bpy.types.Operator, ImportHelper):
 
 class RUST_OT_check_connection(bpy.types.Operator):
     bl_idname = "rust.check_connection"
-    bl_label = "Check Bridge"
-    bl_description = "Test if the Rust Ripper bridge daemon is reachable"
+    bl_label = "Connect to Bridge"
+    bl_description = "Connect to the Rust Ripper daemon bridge"
 
     def execute(self, context):
         try:
             with urllib.request.urlopen(f"{DAEMON}/status", timeout=5) as response:
                 data = json.loads(response.read())
             context.scene.rust_ripper["bridge_connected"] = True
-            self.report({"INFO"}, f"Bridge active — Rust Ripper {data.get('version', '?')}")
+            self.report({"INFO"}, f"Connected — Rust Ripper {data.get('version', '?')}")
         except Exception as e:
             context.scene.rust_ripper["bridge_connected"] = False
             self.report({"WARNING"}, f"Bridge not reachable ({e})")
+        return {"FINISHED"}
+
+
+class RUST_OT_disconnect_bridge(bpy.types.Operator):
+    bl_idname = "rust.disconnect_bridge"
+    bl_label = "Disconnect Bridge"
+    bl_description = "Disconnect from the Rust Ripper bridge"
+
+    def execute(self, context):
+        context.scene.rust_ripper["bridge_connected"] = False
+        self.report({"INFO"}, "Bridge disconnected")
         return {"FINISHED"}
 
 
@@ -794,42 +885,39 @@ class RUST_PT_main(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         settings = context.scene.rust_ripper
-        layout.operator("rust.import_glb", icon="FILE_3D")
+
+        # bridge status — top row
+        connected = settings.get("bridge_connected", False)
+        row = layout.row(align=True)
+        if connected:
+            row.operator("rust.disconnect_bridge", text="Disconnect", icon="UNLINKED")
+            row.label(text="Bridge active", icon="CHECKBOX_HLT")
+        else:
+            row.operator("rust.check_connection", text="Connect", icon="LINKED")
+            row.label(text="No bridge", icon="CHECKBOX_DEHLT")
+
         layout.separator()
         layout.prop(settings, "root_display_size")
         layout.prop(settings, "auto_hide")
         layout.prop(settings, "reuse_meshes")
-        layout.prop(settings, "light_power_scale")
         layout.separator()
         row = layout.row(align=True)
         row.operator("rust.hide_fill_lights", icon="LIGHT_SUN")
         row.operator("rust.show_all_lights", icon="HIDE_OFF")
 
 
-class RUST_PT_bridge(bpy.types.Panel):
-    bl_label = "Bridge"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Rust"
-    bl_parent_id = "RUST_PT_main"
-
-    def draw(self, context):
-        layout = self.layout
-        settings = context.scene.rust_ripper
-        connected = settings.get("bridge_connected", False)
-        row = layout.row(align=True)
-        row.operator("rust.check_connection", icon="URL")
-        if connected:
-            row.label(text="", icon="CHECKBOX_HLT")
-        else:
-            row.label(text="", icon="CHECKBOX_DEHLT")
-        layout.label(
-            text="Connected" if connected else "Not connected",
-            icon="DECORATE_LINKED" if connected else "DECORATE_BROKEN",
-        )
-
-
 # ---------------------------------------------------------------- menu hook
+
+def _apply_outliner_viewport_column(hide):
+    """Hide the viewport restrict column (monitor icon) in all outliners,
+    keeping the hide column (eye icon) visible."""
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == "OUTLINER":
+                for space in area.spaces:
+                    if space.type == "OUTLINER":
+                        space.show_restrict_column_viewport = not hide
+
 
 def _menu_import(self, context):
     self.layout.operator("rust.import_glb", text="Rust Ripper GLB (.glb)")
@@ -839,10 +927,10 @@ classes = (
     RustRipperSettings,
     RUST_OT_import_glb,
     RUST_OT_check_connection,
+    RUST_OT_disconnect_bridge,
     RUST_OT_hide_fill_lights,
     RUST_OT_show_all_lights,
     RUST_PT_main,
-    RUST_PT_bridge,
 )
 
 
@@ -851,6 +939,7 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.Scene.rust_ripper = PointerProperty(type=RustRipperSettings)
     bpy.types.TOPBAR_MT_file_import.append(_menu_import)
+    _apply_outliner_viewport_column(True)
 
 
 def unregister():
@@ -858,6 +947,7 @@ def unregister():
     del bpy.types.Scene.rust_ripper
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
+    _apply_outliner_viewport_column(False)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics.CodeAnalysis;
 using System.Text.Json.Nodes;
 using AssetRipper.Assets;
 using AssetRipper.Assets.Generics;
@@ -6,8 +7,11 @@ using AssetRipper.Export.Modules.Models;
 using AssetRipper.Import.Structure.Assembly;
 using AssetRipper.Import.Structure.Assembly.Serializable;
 using AssetRipper.Numerics;
+using AssetRipper.Processing;
+using AssetRipper.Processing.AnimationClips;
 using AssetRipper.SourceGenerated.Classes.ClassID_1;
 using AssetRipper.SourceGenerated.Classes.ClassID_108;
+using AssetRipper.SourceGenerated.Classes.ClassID_111;
 using AssetRipper.SourceGenerated.Classes.ClassID_114;
 using AssetRipper.SourceGenerated.Classes.ClassID_137;
 using AssetRipper.SourceGenerated.Classes.ClassID_205;
@@ -15,6 +19,9 @@ using AssetRipper.SourceGenerated.Classes.ClassID_25;
 using AssetRipper.SourceGenerated.Classes.ClassID_33;
 using AssetRipper.SourceGenerated.Classes.ClassID_4;
 using AssetRipper.SourceGenerated.Classes.ClassID_43;
+using AssetRipper.SourceGenerated.Classes.ClassID_74;
+using AssetRipper.SourceGenerated.Classes.ClassID_91;
+using AssetRipper.SourceGenerated.Classes.ClassID_95;
 using AssetRipper.SourceGenerated.Enums;
 using AssetRipper.SourceGenerated.Extensions;
 using AssetRipper.SourceGenerated.MarkerInterfaces;
@@ -94,9 +101,12 @@ public class RipperGlbBuilder
     public IReadOnlyDictionary<long, (string MaterialName, AssetRipper.SourceGenerated.Classes.ClassID_28.ITexture2D Mask)> DetailMasks => materials.DetailMasks;
 
     public static SceneBuilder Build(IGameObject root, RipperGlbOptions options)
-        => Build(root, options, out _);
+        => Build(root, options, null, out _);
 
     public static SceneBuilder Build(IGameObject root, RipperGlbOptions options, out RipperGlbBuilder builder)
+        => Build(root, options, null, out builder);
+
+    public static SceneBuilder Build(IGameObject root, RipperGlbOptions options, GameData? gameData, out RipperGlbBuilder builder)
     {
         builder = new RipperGlbBuilder(options);
         builder.BuildLodMembership(root);
@@ -104,10 +114,12 @@ public class RipperGlbBuilder
         builder.BuildHiddenStateVariants(root);
         builder.BuildSocketForceKeep(root);
         builder.BuildBoneKeep(root);
+        builder.PrepareAnimations(root, gameData);
         builder.BuildKeepSet(root);
         var sceneBuilder = new SceneBuilder();
         builder.AddGameObject(sceneBuilder, null, root.GetTransform());
         builder.FinishSkins(sceneBuilder);
+        builder.EmitAnimations();
         return sceneBuilder;
     }
 
@@ -399,6 +411,258 @@ public class RipperGlbBuilder
                 boneKeep.Add(rootBoneGo.PathID);
             }
         }
+    }
+
+    // ---- animations ----
+
+    private readonly List<(IAnimationClip Clip, Dictionary<string, IGameObject> PathMap)> pendingAnimations = new();
+
+    /// <summary>Clips already decoded from their binary muscle data - the
+    /// converter appends to the clip's curve lists, so a daemon session must
+    /// never process the same clip twice.</summary>
+    private static readonly HashSet<(string Collection, long PathID)> processedClips = new();
+
+    /// <summary>
+    /// Find every AnimationClip reachable from Animator/Animation components,
+    /// decode binary clips into editor curves (engine converter + CRC path
+    /// recovery), and force-keep the animated transform paths so pruning and
+    /// empty-collapse cannot eat the animation targets.
+    /// </summary>
+    private void PrepareAnimations(IGameObject root, GameData? gameData)
+    {
+        PathChecksumCache? cache = null;
+        foreach (var gameObject in root.FetchHierarchy().OfType<IGameObject>())
+        {
+            var clips = new List<IAnimationClip>();
+            if (gameObject.TryGetComponent(out IAnimator? animator) && animator is not null)
+            {
+                clips.AddRange(AnimatorClips(animator));
+            }
+            if (gameObject.TryGetComponent(out IAnimation? animation) && animation is not null)
+            {
+                foreach (var clipPtr in animation.Animations)
+                {
+                    if (clipPtr.TryGetAsset(animation.Collection) is IAnimationClip legacyClip)
+                    {
+                        clips.Add(legacyClip);
+                    }
+                }
+            }
+            if (clips.Count == 0)
+            {
+                continue;
+            }
+            var pathMap = new Dictionary<string, IGameObject>();
+            BuildPathMap(gameObject, "", pathMap);
+            foreach (var clip in clips.Distinct())
+            {
+                if (clip.Has_ClipBindingConstant_C74()
+                    && processedClips.Add((clip.Collection.Name, clip.PathID))
+                    && gameData is not null)
+                {
+                    cache ??= new PathChecksumCache(gameData);
+                    try
+                    {
+                        AnimationClipConverter.Process(clip, cache.Value);
+                    }
+                    catch
+                    {
+                        // undecodable clip: skip, everything else still exports
+                        continue;
+                    }
+                }
+                pendingAnimations.Add((clip, pathMap));
+                foreach (var path in ClipPaths(clip))
+                {
+                    if (pathMap.TryGetValue(path, out var target))
+                    {
+                        boneKeep.Add(target.PathID);
+                    }
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<IAnimationClip> AnimatorClips(IAnimator animator)
+    {
+        AssetRipper.SourceGenerated.Classes.ClassID_93.IRuntimeAnimatorController? controller = null;
+        try
+        {
+            if (animator.Has_Controller_PPtr_RuntimeAnimatorController_5())
+            {
+                controller = animator.Controller_PPtr_RuntimeAnimatorController_5P;
+            }
+            else if (animator.Has_Controller_PPtr_RuntimeAnimatorController_4_3())
+            {
+                controller = animator.Controller_PPtr_RuntimeAnimatorController_4_3P;
+            }
+            else if (animator.Has_Controller_PPtr_AnimatorController_4())
+            {
+                controller = (AssetRipper.SourceGenerated.Classes.ClassID_93.IRuntimeAnimatorController?)animator.Controller_PPtr_AnimatorController_4P;
+            }
+        }
+        catch
+        {
+        }
+        return ControllerClips(controller);
+    }
+
+    private static IEnumerable<IAnimationClip> ControllerClips(
+        AssetRipper.SourceGenerated.Classes.ClassID_93.IRuntimeAnimatorController? controller)
+    {
+        if (controller is IAnimatorController direct)
+        {
+            foreach (var clipPtr in direct.AnimationClips)
+            {
+                if (clipPtr.TryGetAsset(direct.Collection) is IAnimationClip clip)
+                {
+                    yield return clip;
+                }
+            }
+        }
+        else if (controller is AssetRipper.SourceGenerated.Classes.ClassID_221.IAnimatorOverrideController overrides)
+        {
+            // per-species clip overrides over a shared base controller
+            // (the new-generation animals): the override clips are the real
+            // animations; base clips fill states the species left alone
+            var replacedOriginals = new HashSet<IAnimationClip>();
+            foreach (var pair in overrides.Clips)
+            {
+                if (pair.OriginalClip.TryGetAsset(overrides.Collection) is IAnimationClip original)
+                {
+                    replacedOriginals.Add(original);
+                }
+                if (pair.OverrideClip.TryGetAsset(overrides.Collection) is IAnimationClip overrideClip)
+                {
+                    yield return overrideClip;
+                }
+            }
+            if (overrides.ControllerP is { } baseController)
+            {
+                foreach (var clip in ControllerClips(baseController))
+                {
+                    if (!replacedOriginals.Contains(clip))
+                    {
+                        yield return clip;
+                    }
+                }
+            }
+        }
+    }
+
+    private static void BuildPathMap(IGameObject parent, string parentPath, Dictionary<string, IGameObject> map)
+    {
+        map[parentPath] = parent;
+        foreach (var childTransform in parent.GetTransform().Children_C4P.WhereNotNull())
+        {
+            if (childTransform.GameObject_C4P is not { } child)
+            {
+                continue;
+            }
+            var path = parentPath.Length == 0 ? child.Name.String : $"{parentPath}/{child.Name.String}";
+            BuildPathMap(child, path, map);
+        }
+    }
+
+    private static IEnumerable<string> ClipPaths(IAnimationClip clip)
+    {
+        foreach (var curve in clip.RotationCurves_C74)
+        {
+            yield return curve.Path.String;
+        }
+        foreach (var curve in clip.PositionCurves_C74)
+        {
+            yield return curve.Path.String;
+        }
+        foreach (var curve in clip.ScaleCurves_C74)
+        {
+            yield return curve.Path.String;
+        }
+        if (clip.Has_EulerCurves_C74())
+        {
+            foreach (var curve in clip.EulerCurves_C74)
+            {
+                yield return curve.Path.String;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Emit decoded curves as glTF animation channels, one glTF animation per
+    /// clip name. Keyframes convert with the same handedness rules as static
+    /// transforms; Hermite slopes flatten to linear keys (exact at the keys).
+    /// Humanoid muscle channels have no transform paths and fall out
+    /// naturally; unresolvable paths are skipped.
+    /// </summary>
+    private void EmitAnimations()
+    {
+        foreach (var (clip, pathMap) in pendingAnimations)
+        {
+            var track = clip.Name.String;
+            foreach (var curve in clip.RotationCurves_C74)
+            {
+                if (!TryGetAnimatedNode(pathMap, curve.Path.String, out var node))
+                {
+                    continue;
+                }
+                var rotation = node.UseRotation(track);
+                foreach (var key in curve.Curve.Curve)
+                {
+                    var q = new System.Numerics.Quaternion(key.Value.X, key.Value.Y, key.Value.Z, key.Value.W);
+                    rotation.WithPoint(key.Time, System.Numerics.Quaternion.Normalize(GlbCoordinateConversion.ToGltfQuaternionConvert(q)));
+                }
+            }
+            if (clip.Has_EulerCurves_C74())
+            {
+                foreach (var curve in clip.EulerCurves_C74)
+                {
+                    if (!TryGetAnimatedNode(pathMap, curve.Path.String, out var node))
+                    {
+                        continue;
+                    }
+                    var rotation = node.UseRotation(track);
+                    foreach (var key in curve.Curve.Curve)
+                    {
+                        // Unity euler order: Z, then X, then Y
+                        var q = System.Numerics.Quaternion.CreateFromYawPitchRoll(
+                            key.Value.Y * (MathF.PI / 180f), key.Value.X * (MathF.PI / 180f), key.Value.Z * (MathF.PI / 180f));
+                        rotation.WithPoint(key.Time, System.Numerics.Quaternion.Normalize(GlbCoordinateConversion.ToGltfQuaternionConvert(q)));
+                    }
+                }
+            }
+            foreach (var curve in clip.PositionCurves_C74)
+            {
+                if (!TryGetAnimatedNode(pathMap, curve.Path.String, out var node))
+                {
+                    continue;
+                }
+                var translation = node.UseTranslation(track);
+                foreach (var key in curve.Curve.Curve)
+                {
+                    translation.WithPoint(key.Time, GlbCoordinateConversion.ToGltfVector3Convert(
+                        new System.Numerics.Vector3(key.Value.X, key.Value.Y, key.Value.Z)));
+                }
+            }
+            foreach (var curve in clip.ScaleCurves_C74)
+            {
+                if (!TryGetAnimatedNode(pathMap, curve.Path.String, out var node))
+                {
+                    continue;
+                }
+                var scale = node.UseScale(track);
+                foreach (var key in curve.Curve.Curve)
+                {
+                    scale.WithPoint(key.Time, new System.Numerics.Vector3(key.Value.X, key.Value.Y, key.Value.Z));
+                }
+            }
+        }
+    }
+
+    private bool TryGetAnimatedNode(Dictionary<string, IGameObject> pathMap, string path, [NotNullWhen(true)] out NodeBuilder? node)
+    {
+        node = null;
+        return pathMap.TryGetValue(path, out var gameObject)
+            && nodeByGameObject.TryGetValue(gameObject.PathID, out node);
     }
 
     /// <summary>Bind stashed skinned meshes once the whole tree (and thus
