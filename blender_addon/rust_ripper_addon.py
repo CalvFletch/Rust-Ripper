@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rust Ripper",
     "author": "Rust Ripper",
-    "version": (0, 2, 1),
+    "version": (0, 2, 2),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > Rust  |  File > Import",
     "description": "Import Rust Ripper GLB exports: PBR materials, blend layers, light tools, bridge connection",
@@ -176,9 +176,15 @@ def _wire_uv(tree, tex_node, mat, objects, uv_index, entry, label):
     source = None
     if uv_name or tiled:
         uv = nodes.new("ShaderNodeUVMap")
+        if not uv_name:
+            # UV set 0: name it explicitly instead of leaving the field empty
+            for obj in objects:
+                if obj.type == "MESH" and any(s.material is mat for s in obj.material_slots) and obj.data.uv_layers:
+                    uv_name = obj.data.uv_layers[0].name
+                    break
         if uv_name:
             uv.uv_map = uv_name
-            uv.label = f"{label} UV{uv_index}"
+        uv.label = f"{label} UV{uv_index}"
         source = uv.outputs["UV"]
     if tiled:
         mapping = nodes.new("ShaderNodeMapping")
@@ -901,6 +907,75 @@ def _count_fur_materials(materials):
     return count
 
 
+# ------------------------------------------------------------- node cleanup
+
+def _prune_unused_nodes(tree):
+    """Remove nodes with no path to any output (Material Output or the glTF
+    settings group): dangling UV maps, orphaned images, importer leftovers.
+    Unreachable nodes cannot affect shading, so this is always safe."""
+    sinks = [n for n in tree.nodes if n.type == "OUTPUT_MATERIAL"
+             or (n.type == "GROUP" and n.node_tree and n.node_tree.name.startswith("glTF"))]
+    keep = set(sinks)
+    stack = list(sinks)
+    while stack:
+        node = stack.pop()
+        for socket in node.inputs:
+            for link in socket.links:
+                if link.from_node not in keep:
+                    keep.add(link.from_node)
+                    stack.append(link.from_node)
+    removed = 0
+    for node in list(tree.nodes):
+        if node not in keep and node.type != "FRAME":
+            tree.nodes.remove(node)
+            removed += 1
+    return removed
+
+
+def _extension_arrange(trees):
+    """Delegate layout to the Node Arrange extension (full Sugiyama: crossing
+    minimization, true node sizes) when it is installed and enabled. Returns
+    False so the caller can fall back to the built-in layout."""
+    if "na_arrange_selected" not in dir(bpy.ops.node):
+        return False
+    window = area = None
+    for w in bpy.context.window_manager.windows:
+        for a in w.screen.areas:
+            if a.type == "NODE_EDITOR":
+                window, area = w, a
+                break
+        if area:
+            break
+    flipped = None
+    if area is None:
+        window = next(iter(bpy.context.window_manager.windows), None)
+        if window is None:
+            return False
+        area = window.screen.areas[0]
+        flipped = (area.type, area.ui_type)
+        area.type = "NODE_EDITOR"
+        area.ui_type = "ShaderNodeTree"
+    space = area.spaces.active
+    region = next((r for r in area.regions if r.type == "WINDOW"), None)
+    if region is None:
+        return False
+    try:
+        for tree in trees:
+            space.path.start(tree)
+            for n in tree.nodes:
+                n.select = n.bl_idname != "NodeFrame"
+            with bpy.context.temp_override(window=window, area=area, region=region, space_data=space):
+                if bpy.ops.node.na_arrange_selected.poll():
+                    bpy.ops.node.na_arrange_selected()
+        return True
+    except Exception:
+        return False
+    finally:
+        if flipped:
+            area.type = flipped[0]
+            area.ui_type = flipped[1]
+
+
 # ------------------------------------------------------------- node layout
 
 _NODE_HEIGHT = {
@@ -1104,13 +1179,15 @@ def _import_glb(context, filepath):
         # transparent bounce budget terminate BLACK between the tufts
         cycles = context.scene.cycles
         cycles.transparent_max_bounces = max(cycles.transparent_max_bounces, 64)
-    # NOTE: nodes should always be created neatly. The current _arrange_nodes is
-    # a basic left-to-right layout. Research better programmatic shader layout
-    # methods (e.g. graphviz-style Sugiyama, or Blender's node.dimensions-based
-    # grid packing) for more readable auto-generated materials.
-    for mat in new_materials:
-        if mat.use_nodes:
-            _arrange_nodes(mat.node_tree)
+    # prune dead nodes first, then lay out: the Node Arrange extension
+    # (full Sugiyama - crossing minimization, true node sizes) does the
+    # arranging when installed; the built-in column layout is the fallback
+    trees = [mat.node_tree for mat in new_materials if mat.use_nodes]
+    for tree in trees:
+        _prune_unused_nodes(tree)
+    if not _extension_arrange(trees):
+        for tree in trees:
+            _arrange_nodes(tree)
     return len(new_objects), hidden, painted, reused
 
 
